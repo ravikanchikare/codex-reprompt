@@ -3984,10 +3984,13 @@ impl App {
                     }
                     // Allow widgets to process any pending timers before rendering.
                     self.chat_widget.pre_draw_tick();
+                    self.chat_widget.tick_reprompt_overlay();
                     tui.draw(
                         self.chat_widget.desired_height(tui.terminal.size()?.width),
                         |frame| {
                             self.chat_widget.render(frame.area(), frame.buffer);
+                            self.chat_widget
+                                .render_reprompt_overlay(frame.area(), frame.buffer);
                             if let Some((x, y)) = self.chat_widget.cursor_pos(frame.area()) {
                                 frame.set_cursor_position((x, y));
                             }
@@ -5521,6 +5524,24 @@ impl App {
                     }
                 }
             }
+            AppEvent::UpdateRepromptProfile(profile) => {
+                self.chat_widget.set_reprompt_profile(profile.clone());
+                let edit = codex_core::config::edit::reprompt_profile_edit(profile.as_deref());
+                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+                    .with_edits([edit])
+                    .apply()
+                    .await
+                {
+                    tracing::error!(error = %err, "failed to persist reprompt profile selection");
+                }
+            }
+            AppEvent::RepromptRefinementResult {
+                original_text,
+                result,
+            } => {
+                self.chat_widget
+                    .on_reprompt_refinement_result(original_text, result);
+            }
         }
         Ok(AppRunControl::Continue)
     }
@@ -5872,6 +5893,14 @@ impl App {
             {
                 let _ = self.select_agent_thread(tui, app_server, thread_id).await;
             }
+            return;
+        }
+
+        // ── /reprompt overlay key interception ──────────────────────
+        if self.chat_widget.has_reprompt_overlay()
+            && self.chat_widget.handle_reprompt_overlay_key(key_event)
+        {
+            tui.frame_requester().schedule_frame();
             return;
         }
 

@@ -567,6 +567,17 @@ pub(crate) enum AppEvent {
     SyntaxThemeSelected {
         name: String,
     },
+
+    /// Update the /reprompt profile selection. `None` disables reprompt.
+    UpdateRepromptProfile(Option<String>),
+
+    /// Result of an async `/reprompt` refinement API call. The widget inspects
+    /// the result and either skips the overlay (when `wasSubstantiveChange` is
+    /// false) or shows the RepromptOverlay for the user to accept/edit/skip.
+    RepromptRefinementResult {
+        original_text: String,
+        result: crate::reprompt::RepromptResult,
+    },
 }
 
 /// The exit strategy requested by the UI layer.

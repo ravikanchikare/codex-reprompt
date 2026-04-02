@@ -287,6 +287,9 @@ pub(super) async fn make_chatwidget_manual(
         realtime_conversation: RealtimeConversationUiState::default(),
         last_rendered_user_message_event: None,
         last_non_retry_error: None,
+        reprompt_config: crate::reprompt::RepromptConfig::default(),
+        reprompt_overlay: None,
+        reprompt_original_text: None,
     };
     widget.set_model(&resolved_model);
     (widget, rx, op_rx)

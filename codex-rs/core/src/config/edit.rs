@@ -103,6 +103,20 @@ pub fn terminal_title_items_edit(items: &[String]) -> ConfigEdit {
     }
 }
 
+/// Produces a config edit that sets or clears the `reprompt_profile` key at the
+/// top level of `config.toml`.
+pub fn reprompt_profile_edit(profile: Option<&str>) -> ConfigEdit {
+    match profile {
+        Some(p) => ConfigEdit::SetPath {
+            segments: vec!["reprompt_profile".to_string()],
+            value: value(p.to_string()),
+        },
+        None => ConfigEdit::ClearPath {
+            segments: vec!["reprompt_profile".to_string()],
+        },
+    }
+}
+
 pub fn model_availability_nux_count_edits(shown_count: &HashMap<String, u32>) -> Vec<ConfigEdit> {
     let mut shown_count_entries: Vec<_> = shown_count.iter().collect();
     shown_count_entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));

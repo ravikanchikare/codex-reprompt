@@ -955,6 +955,12 @@ pub(crate) struct ChatWidget {
     realtime_conversation: RealtimeConversationUiState,
     last_rendered_user_message_event: Option<RenderedUserMessageEvent>,
     last_non_retry_error: Option<(String, String)>,
+    /// `/reprompt` refinement configuration and enabled state.
+    reprompt_config: crate::reprompt::RepromptConfig,
+    /// Active `/reprompt` overlay awaiting user decision (accept/skip/cancel).
+    reprompt_overlay: Option<crate::reprompt::RepromptOverlay>,
+    /// Original text stored while `/reprompt` overlay is active.
+    reprompt_original_text: Option<String>,
 }
 
 /// Cached nickname and role for a collab agent thread, used to attach human-readable labels to
@@ -4568,6 +4574,7 @@ impl ChatWidget {
         let model = model.filter(|m| !m.trim().is_empty());
         let mut config = config;
         config.model = model.clone();
+        let codex_home_for_reprompt = config.codex_home.clone();
         let prevent_idle_sleep = config.features.enabled(Feature::PreventIdleSleep);
         let mut rng = rand::rng();
         let placeholder = PLACEHOLDERS[rng.random_range(0..PLACEHOLDERS.len())].to_string();
@@ -4714,6 +4721,26 @@ impl ChatWidget {
             realtime_conversation: RealtimeConversationUiState::default(),
             last_rendered_user_message_event: None,
             last_non_retry_error: None,
+            reprompt_config: {
+                let mut rc = crate::reprompt::RepromptConfig::default();
+                // Load persisted reprompt_profile from config.toml.
+                if let Ok(toml_text) =
+                    std::fs::read_to_string(codex_home_for_reprompt.join("config.toml"))
+                    && let Ok(doc) = toml_text.parse::<toml::Table>()
+                    && let Some(profile) = doc.get("reprompt_profile").and_then(|v| v.as_str())
+                {
+                    rc.enabled = true;
+                    rc.profile_name = Some(profile.to_string());
+                    let prof = crate::reprompt::profile_config::load_reprompt_profile(
+                        &codex_home_for_reprompt,
+                        profile,
+                    );
+                    rc.model = prof.model;
+                }
+                rc
+            },
+            reprompt_overlay: None,
+            reprompt_original_text: None,
         };
 
         widget
@@ -4884,6 +4911,16 @@ impl ChatWidget {
                         self.reasoning_buffer.clear();
                         self.full_reasoning_buffer.clear();
                         self.set_status_header(String::from("Working"));
+
+                        // ── /reprompt interception ──────────────────────
+                        if self.reprompt_config.enabled
+                            && user_message.text.len() >= self.reprompt_config.min_length
+                            && !user_message.text.starts_with('/')
+                        {
+                            self.spawn_reprompt_refinement(user_message.text);
+                            return;
+                        }
+
                         self.submit_user_message(user_message);
                     } else {
                         self.queue_user_message(user_message);
@@ -5287,6 +5324,9 @@ impl ChatWidget {
             }
             SlashCommand::MemoryUpdate => {
                 self.add_app_server_stub_message("Memory maintenance");
+            }
+            SlashCommand::Reprompt => {
+                self.open_reprompt_profile_picker();
             }
             SlashCommand::Mcp => {
                 self.add_mcp_output();
@@ -10837,10 +10877,20 @@ impl Renderable for ChatWidget {
     }
 
     fn desired_height(&self, width: u16) -> u16 {
-        self.as_renderable().desired_height(width)
+        let base = self.as_renderable().desired_height(width);
+        // When the reprompt overlay is active, request enough height to display it.
+        if let Some(ref overlay) = self.reprompt_overlay {
+            base.max(overlay.desired_height(width))
+        } else {
+            base
+        }
     }
 
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
+        // Hide cursor when the reprompt overlay is active (read-only view).
+        if self.reprompt_overlay.is_some() {
+            return None;
+        }
         self.as_renderable().cursor_pos(area)
     }
 }
@@ -10968,6 +11018,365 @@ impl Notification {
             None
         } else {
             Some(truncate_text(summary, /*max_graphemes*/ 30))
+        }
+    }
+}
+
+impl ChatWidget {
+    // ── /reprompt ────────────────────────────────────────────────────────
+
+    /// Spawn the async reprompt refinement API call for the given text.
+    fn spawn_reprompt_refinement(&mut self, original_text: String) {
+        let auth = match self.resolve_reprompt_auth() {
+            Some(auth) => auth,
+            None => {
+                self.add_info_message(
+                    "REPROMPT: no auth credentials found — submitting original prompt.".to_string(),
+                    /*hint*/ None,
+                );
+                self.submit_text_after_reprompt(original_text);
+                return;
+            }
+        };
+
+        let mut config = self.reprompt_config.clone();
+        let profile_name = config
+            .profile_name
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        let mut profile = crate::reprompt::profile_config::load_reprompt_profile(
+            &self.config.codex_home,
+            &profile_name,
+        );
+
+        // When using the ChatGPT proxy, the default o4-mini model is not
+        // supported. Fall back to the session's configured model instead.
+        let is_chatgpt_proxy = auth.base_url.contains("chatgpt.com");
+        if is_chatgpt_proxy && profile.model == "o4-mini" {
+            let session_model = self
+                .config
+                .model
+                .clone()
+                .unwrap_or_else(|| "gpt-4o-mini".to_string());
+            profile.model = session_model.clone();
+            config.model = session_model;
+        }
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let result =
+                crate::reprompt::refinement::refine_input(&original_text, &config, &auth, &profile)
+                    .await
+                    .unwrap_or_else(|_| crate::reprompt::RepromptResult {
+                        refined_prompt: original_text.clone(),
+                        applied_rules: vec![],
+                        reasoning: "Refinement failed".to_string(),
+                        task_type: crate::reprompt::TaskType::Analysis,
+                        was_substantive_change: false,
+                    });
+            tx.send(crate::app_event::AppEvent::RepromptRefinementResult {
+                original_text,
+                result,
+            });
+        });
+        self.add_info_message(
+            "REPROMPT: refining prompt...".to_string(),
+            /*hint*/ None,
+        );
+    }
+
+    /// Submit text directly, bypassing reprompt interception.
+    fn submit_text_after_reprompt(&mut self, text: String) {
+        let user_message = UserMessage {
+            text,
+            local_images: vec![],
+            remote_image_urls: vec![],
+            text_elements: vec![],
+            mention_bindings: vec![],
+        };
+        self.submit_user_message(user_message);
+    }
+
+    /// Resolve authentication credentials for the reprompt refinement API call.
+    ///
+    /// Tries Codex's own `~/.codex/auth.json` first (supports both ChatGPT OAuth
+    /// and API key modes), then falls back to `OPENAI_API_KEY` env var.
+    ///
+    /// ChatGPT OAuth tokens must go through the ChatGPT proxy
+    /// (`chatgpt.com/backend-api/codex`); direct API keys go to
+    /// `api.openai.com/v1`. The `config.model_provider.base_url` override is
+    /// respected when set.
+    fn resolve_reprompt_auth(&self) -> Option<crate::reprompt::RepromptAuthInfo> {
+        // Primary: Codex auth.json (ChatGPT OAuth or API key).
+        if let Ok(Some(auth)) = codex_login::load_auth_dot_json(
+            &self.config.codex_home,
+            self.config.cli_auth_credentials_store_mode,
+        ) {
+            let is_chatgpt = !matches!(
+                auth.auth_mode,
+                Some(codex_app_server_protocol::AuthMode::ApiKey)
+            );
+
+            // ChatGPT OAuth goes through chatgpt.com proxy; API keys go direct.
+            let default_base = if is_chatgpt {
+                "https://chatgpt.com/backend-api/codex"
+            } else {
+                "https://api.openai.com/v1"
+            };
+            let base_url = self
+                .config
+                .model_provider
+                .base_url
+                .clone()
+                .unwrap_or_else(|| default_base.to_string());
+
+            let (token, account_id) = if is_chatgpt {
+                let tokens = auth.tokens?;
+                let acct = tokens
+                    .account_id
+                    .or(tokens.id_token.chatgpt_account_id.clone());
+                (Some(tokens.access_token), acct)
+            } else {
+                (auth.openai_api_key, None)
+            };
+
+            if let Some(t) = token.filter(|t| !t.is_empty()) {
+                return Some(crate::reprompt::RepromptAuthInfo {
+                    token: t,
+                    base_url,
+                    account_id,
+                });
+            }
+        }
+
+        // Fallback: OPENAI_API_KEY env var.
+        std::env::var("OPENAI_API_KEY")
+            .ok()
+            .map(|key| crate::reprompt::RepromptAuthInfo {
+                token: key,
+                base_url: self
+                    .config
+                    .model_provider
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+                account_id: None,
+            })
+    }
+
+    /// Open the `/reprompt` profile picker with available profiles + a "None" option.
+    fn open_reprompt_profile_picker(&mut self) {
+        let profiles =
+            crate::reprompt::profile_config::list_reprompt_profiles(&self.config.codex_home);
+        let mut items = Vec::new();
+
+        // "None (disable)" option
+        let is_disabled = !self.reprompt_config.enabled;
+        let tx_none = self.app_event_tx.clone();
+        items.push(SelectionItem {
+            name: if is_disabled {
+                "None (disable) [current]".to_string()
+            } else {
+                "None (disable)".to_string()
+            },
+            actions: vec![Box::new(move |_: &AppEventSender| {
+                tx_none.send(crate::app_event::AppEvent::UpdateRepromptProfile(None));
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+
+        // Default "default" if no profile files exist
+        if profiles.is_empty() {
+            let tx = self.app_event_tx.clone();
+            items.push(SelectionItem {
+                name: if self.reprompt_config.enabled && self.reprompt_config.profile_name.is_none()
+                {
+                    "default [current]".to_string()
+                } else {
+                    "default".to_string()
+                },
+                actions: vec![Box::new(move |_: &AppEventSender| {
+                    tx.send(crate::app_event::AppEvent::UpdateRepromptProfile(Some(
+                        "default".to_string(),
+                    )));
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        for profile_name in profiles {
+            let is_current = self.reprompt_config.enabled
+                && self.reprompt_config.profile_name.as_deref() == Some(&profile_name);
+            let display = if is_current {
+                format!("{profile_name} [current]")
+            } else {
+                profile_name.clone()
+            };
+            let tx = self.app_event_tx.clone();
+            let name_clone = profile_name.clone();
+            items.push(SelectionItem {
+                name: display,
+                actions: vec![Box::new(move |_: &AppEventSender| {
+                    tx.send(crate::app_event::AppEvent::UpdateRepromptProfile(Some(
+                        name_clone.clone(),
+                    )));
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Select reprompt profile".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            is_searchable: false,
+            ..Default::default()
+        });
+    }
+
+    /// Called when the async reprompt refinement completes.
+    pub(crate) fn on_reprompt_refinement_result(
+        &mut self,
+        original_text: String,
+        result: crate::reprompt::RepromptResult,
+    ) {
+        if !result.was_substantive_change {
+            self.add_info_message(
+                "REPROMPT: no significant changes — submitting original.".to_string(),
+                /*hint*/ None,
+            );
+            self.submit_text_after_reprompt(original_text);
+            return;
+        }
+        let overlay_data = crate::reprompt::RepromptOverlayData::new(
+            original_text.clone(),
+            result,
+            self.reprompt_config.auto_accept_delay,
+        );
+        self.reprompt_overlay = Some(crate::reprompt::RepromptOverlay::new(overlay_data));
+        self.reprompt_original_text = Some(original_text);
+        self.frame_requester.schedule_frame();
+    }
+
+    /// Handle key events when the reprompt overlay is active. Returns true if consumed.
+    pub(crate) fn handle_reprompt_overlay_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        let Some(overlay) = self.reprompt_overlay.as_mut() else {
+            return false;
+        };
+        let action = overlay.handle_key(key);
+        match action {
+            crate::reprompt::RepromptOverlayAction::Accept(text) => {
+                self.reprompt_overlay = None;
+                self.reprompt_original_text = None;
+                self.submit_text_after_reprompt(text);
+                true
+            }
+            crate::reprompt::RepromptOverlayAction::Skip => {
+                let original = self.reprompt_original_text.take().unwrap_or_default();
+                self.reprompt_overlay = None;
+                self.submit_text_after_reprompt(original);
+                true
+            }
+            crate::reprompt::RepromptOverlayAction::Cancel => {
+                self.reprompt_overlay = None;
+                self.reprompt_original_text = None;
+                true
+            }
+            crate::reprompt::RepromptOverlayAction::ShowReasoning => {
+                self.frame_requester.schedule_frame();
+                true
+            }
+            crate::reprompt::RepromptOverlayAction::None => {
+                // Consume ALL keys while overlay is active so they don't fall
+                // through to normal key handling (e.g. scroll keys).
+                self.frame_requester.schedule_frame();
+                true
+            }
+        }
+    }
+
+    /// Whether a reprompt overlay is currently displayed.
+    pub(crate) fn has_reprompt_overlay(&self) -> bool {
+        self.reprompt_overlay.is_some()
+    }
+
+    /// Check reprompt overlay auto-accept timer.
+    pub(crate) fn tick_reprompt_overlay(&mut self) {
+        if let Some(overlay) = self.reprompt_overlay.as_mut() {
+            if let Some(crate::reprompt::RepromptOverlayAction::Accept(text)) = overlay.tick() {
+                self.reprompt_overlay = None;
+                self.reprompt_original_text = None;
+                self.submit_text_after_reprompt(text);
+            }
+            self.frame_requester.schedule_frame();
+        }
+    }
+
+    /// Render the reprompt overlay into the given area.
+    ///
+    /// The overlay takes over the full frame area (like `/prime` does), clearing
+    /// the background so the refinement preview is the only thing visible.
+    pub(crate) fn render_reprompt_overlay(
+        &self,
+        area: ratatui::layout::Rect,
+        buf: &mut ratatui::buffer::Buffer,
+    ) -> Option<u16> {
+        use ratatui::style::{Color, Style};
+        use ratatui::widgets::{Clear, Widget};
+
+        let overlay = self.reprompt_overlay.as_ref()?;
+
+        // Clear the entire frame area and set a dark background.
+        Clear.render(area, buf);
+        for row in area.y..area.y.saturating_add(area.height) {
+            for col in area.x..area.x.saturating_add(area.width) {
+                if let Some(cell) = buf.cell_mut((col, row)) {
+                    cell.set_style(Style::default().bg(Color::Black));
+                }
+            }
+        }
+
+        // Render the overlay at full frame size.
+        overlay.render_widget(area, buf);
+        Some(area.height)
+    }
+
+    /// Update the reprompt profile selection from an app event.
+    pub(crate) fn set_reprompt_profile(&mut self, profile: Option<String>) {
+        match profile {
+            Some(name) => {
+                let prof = crate::reprompt::profile_config::load_reprompt_profile(
+                    &self.config.codex_home,
+                    &name,
+                );
+                self.reprompt_config.enabled = true;
+                self.reprompt_config.profile_name = Some(name);
+                // Store the profile's model; spawn_reprompt_refinement will
+                // override with the session model when on the ChatGPT proxy.
+                self.reprompt_config.model = prof.model;
+                let display_model = if self.reprompt_config.model == "o4-mini" {
+                    self.config
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| self.reprompt_config.model.clone())
+                } else {
+                    self.reprompt_config.model.clone()
+                };
+                self.add_info_message(
+                    format!(
+                        "REPROMPT: enabled (profile: {}, model: {display_model})",
+                        prof.name
+                    ),
+                    /*hint*/ None,
+                );
+            }
+            None => {
+                self.reprompt_config.enabled = false;
+                self.reprompt_config.profile_name = None;
+                self.add_info_message("REPROMPT: disabled".to_string(), /*hint*/ None);
+            }
         }
     }
 }
