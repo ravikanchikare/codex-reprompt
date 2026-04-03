@@ -965,6 +965,8 @@ pub(crate) struct ChatWidget {
     /// Monotonic generation counter for correlating async reprompt results
     /// with the submission that triggered them.
     reprompt_generation: u64,
+    /// Ring buffer of recent conversation turns for reprompt context.
+    reprompt_context_buffer: crate::reprompt::ThreadContextBuffer,
 }
 
 /// Cached nickname and role for a collab agent thread, used to attach human-readable labels to
@@ -1947,6 +1949,7 @@ impl ChatWidget {
         self.set_skills(/*skills*/ None);
         self.session_network_proxy = event.network_proxy.clone();
         self.thread_id = Some(event.session_id);
+        self.reprompt_context_buffer.clear();
         self.thread_name = event.thread_name.clone();
         self.forked_from = event.forked_from_id;
         self.current_rollout_path = event.rollout_path.clone();
@@ -4051,7 +4054,11 @@ impl ChatWidget {
         self.finalize_completed_assistant_message(
             (!message.is_empty()).then_some(message.as_str()),
         );
-        if self.agent_turn_running && !message.is_empty() {
+        if self.agent_turn_running
+            && !message.is_empty()
+            && matches!(item.phase, Some(MessagePhase::FinalAnswer) | None)
+        {
+            self.reprompt_context_buffer.push_assistant(&message);
             self.pending_turn_copyable_output = Some(message.clone());
         }
         self.pending_status_indicator_restore = match item.phase {
@@ -4746,12 +4753,16 @@ impl ChatWidget {
                     if let Some(secs) = prof.auto_accept_delay_secs {
                         rc.auto_accept_delay = std::time::Duration::from_secs(secs);
                     }
+                    if let Some(ct) = prof.context_turns {
+                        rc.context_turns = ct;
+                    }
                 }
                 rc
             },
             reprompt_overlay: None,
             reprompt_original_message: None,
             reprompt_generation: 0,
+            reprompt_context_buffer: crate::reprompt::ThreadContextBuffer::new(10),
         };
 
         widget
@@ -7207,6 +7218,7 @@ impl ChatWidget {
             || !event.text_elements.is_empty()
             || !remote_image_urls.is_empty()
         {
+            self.reprompt_context_buffer.push_user(&event.message);
             self.add_to_history(history_cell::new_user_prompt(
                 event.message,
                 event.text_elements,
@@ -9984,6 +9996,17 @@ impl ChatWidget {
         self.app_event_tx.send(AppEvent::FetchMcpInventory);
     }
 
+    fn clear_reprompt_loading_if_active(&mut self) {
+        let Some(active) = self.active_cell.as_ref() else {
+            return;
+        };
+        if !active.as_any().is::<history_cell::RepromptLoadingCell>() {
+            return;
+        }
+        self.active_cell = None;
+        self.bump_active_cell_revision();
+    }
+
     /// Remove the MCP loading spinner if it is still the active cell.
     ///
     /// Uses `Any`-based type checking so that a late-arriving inventory result
@@ -10883,6 +10906,15 @@ impl Drop for ChatWidget {
 
 impl Renderable for ChatWidget {
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        if self
+            .active_cell
+            .as_ref()
+            .and_then(|cell| cell.transcript_animation_tick())
+            .is_some()
+        {
+            self.frame_requester
+                .schedule_frame_in(crate::tui::TARGET_FRAME_INTERVAL);
+        }
         self.as_renderable().render(area, buf);
         self.last_rendered_width.set(Some(area.width as usize));
     }
@@ -11042,17 +11074,8 @@ impl ChatWidget {
     /// survive the refinement round-trip.
     fn spawn_reprompt_refinement(&mut self, message: UserMessage) {
         let original_text = message.text.clone();
-        let auth = match self.resolve_reprompt_auth() {
-            Some(auth) => auth,
-            None => {
-                self.add_info_message(
-                    "REPROMPT: no auth credentials found — submitting original prompt.".to_string(),
-                    /*hint*/ None,
-                );
-                self.submit_user_message(message);
-                return;
-            }
-        };
+        self.flush_answer_stream_with_separator();
+        self.clear_reprompt_loading_if_active();
 
         // If there's an in-flight reprompt, submit its original message now
         // so it isn't silently dropped when we overwrite the slot.
@@ -11062,6 +11085,22 @@ impl ChatWidget {
             );
             self.submit_user_message(prev_message);
         }
+        if self.active_cell.is_some() {
+            self.flush_active_cell();
+        }
+
+        let auth = match self.resolve_reprompt_auth() {
+            Some(auth) => auth,
+            None => {
+                self.add_info_message(
+                    "* re:prompt: no auth credentials found — submitting original prompt."
+                        .to_string(),
+                    /*hint*/ None,
+                );
+                self.submit_user_message(message);
+                return;
+            }
+        };
 
         self.reprompt_generation = self.reprompt_generation.wrapping_add(1);
         let generation = self.reprompt_generation;
@@ -11089,28 +11128,40 @@ impl ChatWidget {
             profile.model = session_model.clone();
             config.model = session_model;
         }
+        let effective_context_turns = profile.context_turns.unwrap_or(config.context_turns);
+        let context = self
+            .reprompt_context_buffer
+            .recent(effective_context_turns, 4000);
+
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
-            let result =
-                crate::reprompt::refinement::refine_input(&original_text, &config, &auth, &profile)
-                    .await
-                    .unwrap_or_else(|_| crate::reprompt::RepromptResult {
-                        refined_prompt: original_text.clone(),
-                        applied_rules: vec![],
-                        reasoning: "Refinement failed".to_string(),
-                        task_type: crate::reprompt::TaskType::Analysis,
-                        was_substantive_change: false,
-                    });
+            let result = crate::reprompt::refinement::refine_input(
+                &original_text,
+                &config,
+                &auth,
+                &profile,
+                &context,
+            )
+            .await
+            .unwrap_or_else(|_| crate::reprompt::RepromptResult {
+                refined_prompt: original_text.clone(),
+                applied_rules: vec![],
+                reasoning: "Refinement failed".to_string(),
+                task_type: crate::reprompt::TaskType::Analysis,
+                was_substantive_change: false,
+                tips: vec![],
+            });
             tx.send(crate::app_event::AppEvent::RepromptRefinementResult {
                 original_text,
                 result,
                 generation,
             });
         });
-        self.add_info_message(
-            "REPROMPT: refining prompt...".to_string(),
-            /*hint*/ None,
-        );
+        self.active_cell = Some(Box::new(history_cell::new_reprompt_loading(
+            self.config.animations,
+        )));
+        self.bump_active_cell_revision();
+        self.request_redraw();
     }
 
     /// Submit text after reprompt refinement, preserving non-text attachments
@@ -11289,9 +11340,10 @@ impl ChatWidget {
             );
             return;
         }
+        self.clear_reprompt_loading_if_active();
         if !result.was_substantive_change {
             self.add_info_message(
-                "REPROMPT: no significant changes — submitting original.".to_string(),
+                "* re:prompt: no significant changes — submitting original.".to_string(),
                 /*hint*/ None,
             );
             self.submit_text_after_reprompt(original_text);
@@ -11334,6 +11386,26 @@ impl ChatWidget {
                 self.submit_text_after_reprompt(text);
                 true
             }
+            crate::reprompt::RepromptOverlayAction::Iterate(text) => {
+                let (local_image_paths, remote_image_urls) = self
+                    .reprompt_original_message
+                    .take()
+                    .map(|message| {
+                        (
+                            message
+                                .local_images
+                                .into_iter()
+                                .map(|image| image.path)
+                                .collect(),
+                            message.remote_image_urls,
+                        )
+                    })
+                    .unwrap_or_else(|| (Vec::new(), Vec::new()));
+                self.reprompt_overlay = None;
+                self.set_remote_image_urls(remote_image_urls);
+                self.set_composer_text(text, Vec::new(), local_image_paths);
+                true
+            }
             crate::reprompt::RepromptOverlayAction::Skip => {
                 let original = self
                     .reprompt_original_message
@@ -11369,9 +11441,8 @@ impl ChatWidget {
 
     /// Check reprompt overlay auto-accept timer.
     ///
-    /// Only schedules a redraw when the countdown is active (non-zero delay
-    /// and still ticking), avoiding continuous redraws while the overlay is
-    /// idle or auto-accept is disabled.
+    /// Only schedules a redraw when the countdown or rotating tips need it,
+    /// avoiding continuous redraws while the overlay is idle.
     pub(crate) fn tick_reprompt_overlay(&mut self) {
         if let Some(overlay) = self.reprompt_overlay.as_mut() {
             if let Some(crate::reprompt::RepromptOverlayAction::Accept(text)) = overlay.tick() {
@@ -11379,8 +11450,8 @@ impl ChatWidget {
                 self.submit_text_after_reprompt(text);
                 return;
             }
-            // Only schedule redraws when the countdown is active and needs
-            // second-level updates; otherwise the overlay is idle.
+            // Only schedule redraws when the countdown or tip rotation is
+            // active; otherwise the overlay is idle.
             if overlay.has_active_countdown() {
                 self.frame_requester.schedule_frame();
             }
@@ -11396,8 +11467,10 @@ impl ChatWidget {
         area: ratatui::layout::Rect,
         buf: &mut ratatui::buffer::Buffer,
     ) -> Option<u16> {
-        use ratatui::style::{Color, Style};
-        use ratatui::widgets::{Clear, Widget};
+        use ratatui::style::Color;
+        use ratatui::style::Style;
+        use ratatui::widgets::Clear;
+        use ratatui::widgets::Widget;
 
         let overlay = self.reprompt_overlay.as_ref()?;
 
@@ -11435,6 +11508,8 @@ impl ChatWidget {
                     .auto_accept_delay_secs
                     .map(std::time::Duration::from_secs)
                     .unwrap_or(defaults.auto_accept_delay);
+                self.reprompt_config.context_turns =
+                    prof.context_turns.unwrap_or(defaults.context_turns);
                 let display_model = if self.reprompt_config.model == "o4-mini" {
                     self.config
                         .model
@@ -11445,7 +11520,7 @@ impl ChatWidget {
                 };
                 self.add_info_message(
                     format!(
-                        "REPROMPT: enabled (profile: {}, model: {display_model})",
+                        "* re:prompt: enabled (profile: {}, model: {display_model})",
                         prof.name
                     ),
                     /*hint*/ None,
@@ -11454,7 +11529,7 @@ impl ChatWidget {
             None => {
                 self.reprompt_config.enabled = false;
                 self.reprompt_config.profile_name = None;
-                self.add_info_message("REPROMPT: disabled".to_string(), /*hint*/ None);
+                self.add_info_message("* re:prompt: disabled".to_string(), /*hint*/ None);
             }
         }
     }

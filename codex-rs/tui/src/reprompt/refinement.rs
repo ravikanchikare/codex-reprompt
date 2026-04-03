@@ -6,6 +6,7 @@
 //! On any error, returns the original prompt wrapped in a `RepromptResult` with
 //! `was_substantive_change = false` so the flow degrades gracefully.
 
+use codex_login::default_client::build_reqwest_client;
 use serde_json::json;
 
 use super::RepromptConfig;
@@ -51,6 +52,32 @@ Do NOT apply rules from other task types.
 8. Keep it concise -- agents work best with clear, focused prompts
 9. If the input is already clear and specific, return it mostly unchanged
 
+## Step 4: Generate tips
+After refining, generate 0-3 short tips about the ORIGINAL prompt.
+Each tip should:
+- Identify one critical flaw or missed opportunity
+- Be a single sentence under 80 characters
+- Be readable within 5 seconds
+- Be actionable and specific
+- Focus on what the user can improve
+
+Categories to check (priority order):
+1. Missing file paths, function names, or modules
+2. Ambiguous references ("it", "that", "the bug")
+3. No verification criteria
+4. Multiple unrelated requests
+5. Missing error messages or reproduction steps
+
+Only include tips for real issues. If the prompt is good, return an empty array.
+
+## Conversation context
+The input messages may include recent conversation turns before the current
+user input. Use this context to:
+- Resolve anaphoric references ("that", "it", "the same fix")
+- Understand recently discussed files, functions, or patterns
+- Detect task continuity vs. topic changes
+The LAST user message is the one to refine. Prior messages are read-only context.
+
 ## Critical rule:
 If the user's input is already precise and well-structured, set
 wasSubstantiveChange to false and return the original with minimal changes.
@@ -59,7 +86,7 @@ not to rewrite everything.
 
 ## Output:
 Return a RepromptResult JSON with: refinedPrompt, appliedRules, reasoning,
-taskType, wasSubstantiveChange."#;
+taskType, wasSubstantiveChange, tips."#;
 
 /// JSON schema for structured output, matching the `RepromptResult` type.
 fn reprompt_result_json_schema() -> serde_json::Value {
@@ -79,14 +106,23 @@ fn reprompt_result_json_schema() -> serde_json::Value {
                     "type": "string",
                     "enum": ["bugfix", "feature", "refactor", "security", "analysis", "review"]
                 },
-                "wasSubstantiveChange": { "type": "boolean" }
+                "wasSubstantiveChange": { "type": "boolean" },
+                "tips": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "maxLength": 80
+                    },
+                    "maxItems": 3
+                }
             },
             "required": [
                 "refinedPrompt",
                 "appliedRules",
                 "reasoning",
                 "taskType",
-                "wasSubstantiveChange"
+                "wasSubstantiveChange",
+                "tips"
             ],
             "additionalProperties": false
         }
@@ -106,6 +142,7 @@ fn fallback_result(original: &str) -> RepromptResult {
         reasoning: "Refinement API call failed; returning original input.".to_string(),
         task_type: TaskType::Analysis,
         was_substantive_change: false,
+        tips: vec![],
     }
 }
 
@@ -119,6 +156,7 @@ pub(crate) async fn refine_input(
     config: &RepromptConfig,
     auth: &super::RepromptAuthInfo,
     profile: &RepromptProfile,
+    context: &[super::thread_context::ContextTurn],
 ) -> anyhow::Result<RepromptResult> {
     let api_key = &auth.token;
     let base_url = &auth.base_url;
@@ -139,25 +177,31 @@ pub(crate) async fn refine_input(
     let system_prompt = build_system_prompt(base_prompt, &rules_text);
 
     tracing::debug!(
-        "REPROMPT: profile={}, model={}, rules={}, custom_system_prompt={}, user_input={}",
+        "REPROMPT: profile={}, model={}, rules={}, custom_system_prompt={}, context_turns={}, user_input={}",
         profile.name,
         model,
         rules_text,
         profile.system_prompt.is_some(),
+        context.len(),
         original,
     );
     tracing::debug!("REPROMPT SYSTEM PROMPT:\n{system_prompt}");
 
     let schema = reprompt_result_json_schema();
 
+    let mut input_messages: Vec<serde_json::Value> = Vec::new();
+    for turn in context {
+        let role = match turn.role {
+            super::thread_context::ContextRole::User => "user",
+            super::thread_context::ContextRole::Assistant => "assistant",
+        };
+        input_messages.push(json!({ "role": role, "content": turn.text }));
+    }
+    input_messages.push(json!({ "role": "user", "content": original }));
+
     let request_body = json!({
         "model": model,
-        "input": [
-            {
-                "role": "user",
-                "content": original
-            }
-        ],
+        "input": input_messages,
         "instructions": system_prompt,
         "text": {
             "format": {
@@ -171,7 +215,7 @@ pub(crate) async fn refine_input(
         "stream": true
     });
 
-    let client = reqwest::Client::new();
+    let client = build_reqwest_client();
     let mut req = client
         .post(format!("{base_url}/responses"))
         .header("Authorization", format!("Bearer {api_key}"))
@@ -306,7 +350,8 @@ mod tests {
         assert!(schema.get("schema").is_some());
         let inner = schema.get("schema").unwrap();
         let required = inner.get("required").unwrap().as_array().unwrap();
-        assert_eq!(required.len(), 5);
+        assert_eq!(required.len(), 6);
+        assert!(required.contains(&serde_json::Value::String("tips".to_string())));
     }
 
     #[tokio::test]
@@ -318,7 +363,7 @@ mod tests {
             account_id: None,
         };
         let profile = RepromptProfile::default();
-        let result = refine_input("test prompt", &config, &auth, &profile)
+        let result = refine_input("test prompt", &config, &auth, &profile, &[])
             .await
             .unwrap();
         assert_eq!(result.refined_prompt, "test prompt");

@@ -41,6 +41,8 @@ pub(crate) struct RepromptProfile {
     pub min_length: Option<usize>,
     /// Seconds before auto-accepting the refined prompt.
     pub auto_accept_delay_secs: Option<u64>,
+    /// Override the number of context turns for this profile. `Some(0)` disables.
+    pub context_turns: Option<usize>,
 }
 
 impl Default for RepromptProfile {
@@ -53,6 +55,7 @@ impl Default for RepromptProfile {
             rules: vec![],
             min_length: None,
             auto_accept_delay_secs: None,
+            context_turns: None,
         }
     }
 }
@@ -115,6 +118,7 @@ struct RepromptSection {
     prompt: Option<PromptSection>,
     min_length: Option<usize>,
     auto_accept_delay_secs: Option<u64>,
+    context_turns: Option<usize>,
     /// Individual rules: `[[reprompt.rules]]` with `rule` + optional `task_type`.
     rules: Option<Vec<RuleEntry>>,
     /// Grouped rules: `[[reprompt.rule_groups]]` with `task_type` + `rules` array.
@@ -247,6 +251,7 @@ pub(crate) fn load_reprompt_profile(codex_home: &Path, profile_name: &str) -> Re
         rules,
         min_length: section.min_length,
         auto_accept_delay_secs: section.auto_accept_delay_secs,
+        context_turns: section.context_turns,
     }
 }
 

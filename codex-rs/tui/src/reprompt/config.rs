@@ -68,6 +68,10 @@ pub(crate) struct RepromptResult {
     /// `false` when the refinement barely changed the original input.
     /// When `false`, the overlay is skipped and the original is sent through.
     pub was_substantive_change: bool,
+
+    /// Short suggestions for improving the original prompt on future turns.
+    #[serde(default)]
+    pub tips: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +101,10 @@ pub(crate) struct RepromptConfig {
     /// Seconds to wait before auto-accepting the refinement.
     /// `0` means manual-only (no auto-accept).
     pub auto_accept_delay: Duration,
+
+    /// Maximum number of prior conversation turns to include as context
+    /// for the refinement model. `0` disables context.
+    pub context_turns: usize,
 }
 
 impl Default for RepromptConfig {
@@ -108,6 +116,7 @@ impl Default for RepromptConfig {
             min_length: 20,
             show_diff: false,
             auto_accept_delay: Duration::from_secs(15),
+            context_turns: 4,
         }
     }
 }
@@ -165,6 +174,8 @@ pub(crate) enum RepromptOverlayState {
 pub(crate) enum RepromptOverlayAction {
     /// Accept the refined (or edited) prompt and send it as the turn input.
     Accept(String),
+    /// Insert the refined prompt back into the composer for further editing.
+    Iterate(String),
     /// Skip refinement this time — send the original input.
     Skip,
     /// Show the model's reasoning in a secondary pane / tooltip.
@@ -197,7 +208,8 @@ pub(crate) struct RepromptOverlayData {
 
 impl RepromptOverlayData {
     /// Create a new overlay data bundle in the `Reviewing` state.
-    pub fn new(original: String, result: RepromptResult, auto_accept_delay: Duration) -> Self {
+    pub fn new(original: String, mut result: RepromptResult, auto_accept_delay: Duration) -> Self {
+        result.tips.truncate(3);
         Self {
             original,
             result,
@@ -250,6 +262,11 @@ mod tests {
             reasoning: "Expanded vague reference to specific fix pattern".to_string(),
             task_type: TaskType::Bugfix,
             was_substantive_change: true,
+            tips: vec![
+                "Add a file path to skip discovery".to_string(),
+                "Name the exact bug instead of 'it'".to_string(),
+                "Add a verification step like tests".to_string(),
+            ],
         }
     }
 
@@ -281,6 +298,7 @@ mod tests {
         assert_eq!(result.task_type, TaskType::Bugfix);
         assert!(result.was_substantive_change);
         assert_eq!(result.applied_rules.len(), 1);
+        assert!(result.tips.is_empty());
     }
 
     #[test]
@@ -291,6 +309,7 @@ mod tests {
         assert_eq!(config.min_length, 20);
         assert!(!config.show_diff);
         assert_eq!(config.auto_accept_delay, Duration::from_secs(15));
+        assert_eq!(config.context_turns, 4);
         assert!(config.profile_name.is_none());
     }
 
@@ -335,6 +354,24 @@ mod tests {
         assert!(json.get("refinedPrompt").is_some());
         assert!(json.get("wasSubstantiveChange").is_some());
         assert!(json.get("taskType").is_some());
+        assert!(json.get("tips").is_some());
         assert_eq!(json["taskType"], "bugfix");
+    }
+
+    #[test]
+    fn overlay_data_caps_tips_at_three() {
+        let mut result = sample_reprompt_result();
+        result.tips.push("Fourth tip should be dropped".to_string());
+
+        let data = RepromptOverlayData::new("original".to_string(), result, Duration::ZERO);
+
+        assert_eq!(
+            data.result.tips,
+            vec![
+                "Add a file path to skip discovery".to_string(),
+                "Name the exact bug instead of 'it'".to_string(),
+                "Add a verification step like tests".to_string(),
+            ]
+        );
     }
 }

@@ -19,6 +19,7 @@ pub(crate) mod config;
 pub(crate) mod overlay;
 pub(crate) mod profile_config;
 pub(crate) mod refinement;
+pub(crate) mod thread_context;
 
 pub(crate) use config::RepromptAuthInfo;
 pub(crate) use config::RepromptConfig;
@@ -29,3 +30,4 @@ pub(crate) use config::RepromptResult;
 pub(crate) use config::TaskType;
 pub(crate) use overlay::RepromptOverlay;
 pub(crate) use profile_config::RepromptProfile;
+pub(crate) use thread_context::ThreadContextBuffer;

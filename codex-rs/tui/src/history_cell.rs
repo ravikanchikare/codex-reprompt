@@ -2210,6 +2210,55 @@ pub(crate) fn new_mcp_inventory_loading(animations_enabled: bool) -> McpInventor
     McpInventoryLoadingCell::new(animations_enabled)
 }
 
+/// A transient history cell that shows an animated spinner while `/reprompt`
+/// refinement is in flight.
+///
+/// Inserted as the `active_cell` by `ChatWidget::spawn_reprompt_refinement()`
+/// and removed once the refinement result arrives so the loader does not get
+/// committed into transcript history.
+#[derive(Debug)]
+pub(crate) struct RepromptLoadingCell {
+    start_time: Instant,
+    animations_enabled: bool,
+}
+
+impl RepromptLoadingCell {
+    pub(crate) fn new(animations_enabled: bool) -> Self {
+        Self {
+            start_time: Instant::now(),
+            animations_enabled,
+        }
+    }
+}
+
+impl HistoryCell for RepromptLoadingCell {
+    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        vec![
+            vec![
+                spinner(Some(self.start_time), self.animations_enabled),
+                " ".into(),
+                "REPROMPT".cyan().bold(),
+                ": ".into(),
+                "Refining prompt".bold(),
+                "…".dim(),
+            ]
+            .into(),
+        ]
+    }
+
+    fn transcript_animation_tick(&self) -> Option<u64> {
+        if !self.animations_enabled {
+            return None;
+        }
+        Some((self.start_time.elapsed().as_millis() / 50) as u64)
+    }
+}
+
+/// Convenience constructor for [`RepromptLoadingCell`].
+pub(crate) fn new_reprompt_loading(animations_enabled: bool) -> RepromptLoadingCell {
+    RepromptLoadingCell::new(animations_enabled)
+}
+
 /// Renders a completed (or interrupted) request_user_input exchange in history.
 #[derive(Debug)]
 pub(crate) struct RequestUserInputResultCell {
@@ -3580,6 +3629,14 @@ mod tests {
     #[test]
     fn mcp_inventory_loading_snapshot() {
         let cell = new_mcp_inventory_loading(/*animations_enabled*/ true);
+        let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn reprompt_loading_snapshot() {
+        let cell = new_reprompt_loading(/*animations_enabled*/ true);
         let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
 
         insta::assert_snapshot!(rendered);
