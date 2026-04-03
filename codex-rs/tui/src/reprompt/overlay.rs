@@ -79,6 +79,24 @@ impl RepromptOverlay {
             return RepromptOverlayAction::None;
         }
 
+        if let RepromptOverlayState::Editing(ref text) = self.data.state {
+            return match key.code {
+                KeyCode::Esc => {
+                    self.data.state = RepromptOverlayState::Reviewing;
+                    RepromptOverlayAction::None
+                }
+                KeyCode::Enter => {
+                    let edited = text.clone();
+                    self.data.state = RepromptOverlayState::Accepted(edited.clone());
+                    let action = RepromptOverlayAction::Accept(edited);
+                    self.action = Some(action.clone());
+                    self.done = true;
+                    action
+                }
+                _ => RepromptOverlayAction::None,
+            };
+        }
+
         if !matches!(self.data.state, RepromptOverlayState::Reviewing) {
             return RepromptOverlayAction::None;
         }
@@ -263,6 +281,17 @@ impl RepromptOverlay {
     /// Whether the overlay has completed (user made a decision).
     pub(crate) fn is_complete(&self) -> bool {
         self.done
+    }
+
+    /// Whether the auto-accept countdown is active (non-zero delay, in
+    /// Reviewing state, and not yet elapsed). Used to avoid continuous
+    /// redraws when the overlay is idle.
+    pub(crate) fn has_active_countdown(&self) -> bool {
+        matches!(self.data.state, RepromptOverlayState::Reviewing)
+            && self
+                .data
+                .auto_accept_remaining()
+                .is_some_and(|secs| secs > 0)
     }
 
     /// Handle Ctrl-C as a cancel action.
@@ -464,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn keys_ignored_when_not_reviewing() {
+    fn editing_enter_accepts() {
         let mut overlay = make_overlay();
         overlay.handle_key(KeyEvent::new(
             KeyCode::Char('e'),
@@ -474,8 +503,48 @@ mod tests {
             KeyCode::Enter,
             crossterm::event::KeyModifiers::NONE,
         ));
-        assert_eq!(action, RepromptOverlayAction::None);
+        assert!(
+            matches!(action, RepromptOverlayAction::Accept(ref t) if t == "Apply the JWT fix to payments")
+        );
+        assert!(overlay.is_complete());
+    }
+
+    #[test]
+    fn editing_esc_returns_to_reviewing() {
+        let mut overlay = make_overlay();
+        overlay.handle_key(KeyEvent::new(
+            KeyCode::Char('e'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(matches!(
+            overlay.data.state,
+            RepromptOverlayState::Editing(_)
+        ));
+        overlay.handle_key(KeyEvent::new(
+            KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(matches!(
+            overlay.data.state,
+            RepromptOverlayState::Reviewing
+        ));
         assert!(!overlay.is_complete());
+    }
+
+    #[test]
+    fn keys_ignored_in_terminal_states() {
+        let mut overlay = make_overlay();
+        // Accept, then verify further keys are ignored.
+        overlay.handle_key(KeyEvent::new(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(overlay.is_complete());
+        let action = overlay.handle_key(KeyEvent::new(
+            KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(action, RepromptOverlayAction::None);
     }
 
     #[test]

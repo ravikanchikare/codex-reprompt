@@ -959,8 +959,12 @@ pub(crate) struct ChatWidget {
     reprompt_config: crate::reprompt::RepromptConfig,
     /// Active `/reprompt` overlay awaiting user decision (accept/skip/cancel).
     reprompt_overlay: Option<crate::reprompt::RepromptOverlay>,
-    /// Original text stored while `/reprompt` overlay is active.
-    reprompt_original_text: Option<String>,
+    /// Original message stored while `/reprompt` overlay is active, so that
+    /// non-text attachments (images, mentions) are preserved through refinement.
+    reprompt_original_message: Option<UserMessage>,
+    /// Monotonic generation counter for correlating async reprompt results
+    /// with the submission that triggered them.
+    reprompt_generation: u64,
 }
 
 /// Cached nickname and role for a collab agent thread, used to attach human-readable labels to
@@ -4736,11 +4740,18 @@ impl ChatWidget {
                         profile,
                     );
                     rc.model = prof.model;
+                    if let Some(min_length) = prof.min_length {
+                        rc.min_length = min_length;
+                    }
+                    if let Some(secs) = prof.auto_accept_delay_secs {
+                        rc.auto_accept_delay = std::time::Duration::from_secs(secs);
+                    }
                 }
                 rc
             },
             reprompt_overlay: None,
-            reprompt_original_text: None,
+            reprompt_original_message: None,
+            reprompt_generation: 0,
         };
 
         widget
@@ -4917,7 +4928,7 @@ impl ChatWidget {
                             && user_message.text.len() >= self.reprompt_config.min_length
                             && !user_message.text.starts_with('/')
                         {
-                            self.spawn_reprompt_refinement(user_message.text);
+                            self.spawn_reprompt_refinement(user_message);
                             return;
                         }
 
@@ -11025,8 +11036,12 @@ impl Notification {
 impl ChatWidget {
     // ── /reprompt ────────────────────────────────────────────────────────
 
-    /// Spawn the async reprompt refinement API call for the given text.
-    fn spawn_reprompt_refinement(&mut self, original_text: String) {
+    /// Spawn the async reprompt refinement API call for the given message.
+    ///
+    /// Stores the full `UserMessage` so non-text attachments (images, mentions)
+    /// survive the refinement round-trip.
+    fn spawn_reprompt_refinement(&mut self, message: UserMessage) {
+        let original_text = message.text.clone();
         let auth = match self.resolve_reprompt_auth() {
             Some(auth) => auth,
             None => {
@@ -11034,10 +11049,23 @@ impl ChatWidget {
                     "REPROMPT: no auth credentials found — submitting original prompt.".to_string(),
                     /*hint*/ None,
                 );
-                self.submit_text_after_reprompt(original_text);
+                self.submit_user_message(message);
                 return;
             }
         };
+
+        // If there's an in-flight reprompt, submit its original message now
+        // so it isn't silently dropped when we overwrite the slot.
+        if let Some(prev_message) = self.reprompt_original_message.take() {
+            tracing::debug!(
+                "Submitting previous in-flight reprompt message before starting new refinement"
+            );
+            self.submit_user_message(prev_message);
+        }
+
+        self.reprompt_generation = self.reprompt_generation.wrapping_add(1);
+        let generation = self.reprompt_generation;
+        self.reprompt_original_message = Some(message);
 
         let mut config = self.reprompt_config.clone();
         let profile_name = config
@@ -11076,6 +11104,7 @@ impl ChatWidget {
             tx.send(crate::app_event::AppEvent::RepromptRefinementResult {
                 original_text,
                 result,
+                generation,
             });
         });
         self.add_info_message(
@@ -11084,16 +11113,26 @@ impl ChatWidget {
         );
     }
 
-    /// Submit text directly, bypassing reprompt interception.
+    /// Submit text after reprompt refinement, preserving non-text attachments
+    /// (images) from the original message. Text-offset-dependent metadata
+    /// (text_elements, mention_bindings) is cleared because the refined text
+    /// has different offsets than the original.
     fn submit_text_after_reprompt(&mut self, text: String) {
-        let user_message = UserMessage {
-            text,
-            local_images: vec![],
-            remote_image_urls: vec![],
-            text_elements: vec![],
-            mention_bindings: vec![],
-        };
-        self.submit_user_message(user_message);
+        let mut message = self
+            .reprompt_original_message
+            .take()
+            .unwrap_or_else(|| UserMessage {
+                text: String::new(),
+                local_images: vec![],
+                remote_image_urls: vec![],
+                text_elements: vec![],
+                mention_bindings: vec![],
+            });
+        message.text = text;
+        // Clear offset-dependent metadata that would be stale after text rewrite.
+        message.text_elements.clear();
+        message.mention_bindings.clear();
+        self.submit_user_message(message);
     }
 
     /// Resolve authentication credentials for the reprompt refinement API call.
@@ -11241,7 +11280,15 @@ impl ChatWidget {
         &mut self,
         original_text: String,
         result: crate::reprompt::RepromptResult,
+        generation: u64,
     ) {
+        if generation != self.reprompt_generation {
+            tracing::debug!(
+                "Discarding stale reprompt result (generation {generation} != {})",
+                self.reprompt_generation,
+            );
+            return;
+        }
         if !result.was_substantive_change {
             self.add_info_message(
                 "REPROMPT: no significant changes — submitting original.".to_string(),
@@ -11251,12 +11298,11 @@ impl ChatWidget {
             return;
         }
         let overlay_data = crate::reprompt::RepromptOverlayData::new(
-            original_text.clone(),
+            original_text,
             result,
             self.reprompt_config.auto_accept_delay,
         );
         self.reprompt_overlay = Some(crate::reprompt::RepromptOverlay::new(overlay_data));
-        self.reprompt_original_text = Some(original_text);
         self.frame_requester.schedule_frame();
     }
 
@@ -11265,23 +11311,42 @@ impl ChatWidget {
         let Some(overlay) = self.reprompt_overlay.as_mut() else {
             return false;
         };
+
+        // Let Ctrl-C cancel the overlay and then fall through to normal
+        // Ctrl-C handling (quit shortcut, interrupt) instead of being swallowed.
+        if key.kind == crossterm::event::KeyEventKind::Press
+            && key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+            && matches!(key.code, crossterm::event::KeyCode::Char('c' | 'C'))
+        {
+            overlay.on_ctrl_c();
+            self.reprompt_overlay = None;
+            self.reprompt_original_message = None;
+            // Return false so the event reaches on_ctrl_c() in normal handling.
+            return false;
+        }
+
         let action = overlay.handle_key(key);
         match action {
             crate::reprompt::RepromptOverlayAction::Accept(text) => {
                 self.reprompt_overlay = None;
-                self.reprompt_original_text = None;
                 self.submit_text_after_reprompt(text);
                 true
             }
             crate::reprompt::RepromptOverlayAction::Skip => {
-                let original = self.reprompt_original_text.take().unwrap_or_default();
+                let original = self
+                    .reprompt_original_message
+                    .as_ref()
+                    .map(|m| m.text.clone())
+                    .unwrap_or_default();
                 self.reprompt_overlay = None;
                 self.submit_text_after_reprompt(original);
                 true
             }
             crate::reprompt::RepromptOverlayAction::Cancel => {
                 self.reprompt_overlay = None;
-                self.reprompt_original_text = None;
+                self.reprompt_original_message = None;
                 true
             }
             crate::reprompt::RepromptOverlayAction::ShowReasoning => {
@@ -11303,14 +11368,22 @@ impl ChatWidget {
     }
 
     /// Check reprompt overlay auto-accept timer.
+    ///
+    /// Only schedules a redraw when the countdown is active (non-zero delay
+    /// and still ticking), avoiding continuous redraws while the overlay is
+    /// idle or auto-accept is disabled.
     pub(crate) fn tick_reprompt_overlay(&mut self) {
         if let Some(overlay) = self.reprompt_overlay.as_mut() {
             if let Some(crate::reprompt::RepromptOverlayAction::Accept(text)) = overlay.tick() {
                 self.reprompt_overlay = None;
-                self.reprompt_original_text = None;
                 self.submit_text_after_reprompt(text);
+                return;
             }
-            self.frame_requester.schedule_frame();
+            // Only schedule redraws when the countdown is active and needs
+            // second-level updates; otherwise the overlay is idle.
+            if overlay.has_active_countdown() {
+                self.frame_requester.schedule_frame();
+            }
         }
     }
 
@@ -11356,6 +11429,12 @@ impl ChatWidget {
                 // Store the profile's model; spawn_reprompt_refinement will
                 // override with the session model when on the ChatGPT proxy.
                 self.reprompt_config.model = prof.model;
+                let defaults = crate::reprompt::RepromptConfig::default();
+                self.reprompt_config.min_length = prof.min_length.unwrap_or(defaults.min_length);
+                self.reprompt_config.auto_accept_delay = prof
+                    .auto_accept_delay_secs
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or(defaults.auto_accept_delay);
                 let display_model = if self.reprompt_config.model == "o4-mini" {
                     self.config
                         .model

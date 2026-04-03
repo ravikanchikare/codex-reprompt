@@ -23,6 +23,7 @@ pub(crate) enum TaskType {
     Bugfix,
     Feature,
     Refactor,
+    Security,
     Analysis,
     Review,
 }
@@ -33,6 +34,7 @@ impl std::fmt::Display for TaskType {
             Self::Bugfix => write!(f, "bugfix"),
             Self::Feature => write!(f, "feature"),
             Self::Refactor => write!(f, "refactor"),
+            Self::Security => write!(f, "security"),
             Self::Analysis => write!(f, "analysis"),
             Self::Review => write!(f, "review"),
         }
@@ -257,6 +259,7 @@ mod tests {
             (TaskType::Bugfix, "bugfix"),
             (TaskType::Feature, "feature"),
             (TaskType::Refactor, "refactor"),
+            (TaskType::Security, "security"),
             (TaskType::Analysis, "analysis"),
             (TaskType::Review, "review"),
         ] {

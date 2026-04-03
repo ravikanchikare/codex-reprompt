@@ -77,7 +77,7 @@ fn reprompt_result_json_schema() -> serde_json::Value {
                 "reasoning": { "type": "string" },
                 "taskType": {
                     "type": "string",
-                    "enum": ["bugfix", "feature", "refactor", "analysis", "review"]
+                    "enum": ["bugfix", "feature", "refactor", "security", "analysis", "review"]
                 },
                 "wasSubstantiveChange": { "type": "boolean" }
             },
@@ -138,7 +138,7 @@ pub(crate) async fn refine_input(
 
     let system_prompt = build_system_prompt(base_prompt, &rules_text);
 
-    tracing::info!(
+    tracing::debug!(
         "REPROMPT: profile={}, model={}, rules={}, custom_system_prompt={}, user_input={}",
         profile.name,
         model,
@@ -146,7 +146,7 @@ pub(crate) async fn refine_input(
         profile.system_prompt.is_some(),
         original,
     );
-    tracing::info!("REPROMPT SYSTEM PROMPT:\n{system_prompt}");
+    tracing::debug!("REPROMPT SYSTEM PROMPT:\n{system_prompt}");
 
     let schema = reprompt_result_json_schema();
 
@@ -258,7 +258,7 @@ pub(crate) async fn refine_input(
 
     match serde_json::from_str::<RepromptResult>(&output_text) {
         Ok(result) => {
-            tracing::info!(
+            tracing::debug!(
                 "Reprompt refinement succeeded: substantive={}, task={}, reasoning={}, refined={}",
                 result.was_substantive_change,
                 result.task_type,

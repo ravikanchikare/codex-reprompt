@@ -5538,9 +5538,10 @@ impl App {
             AppEvent::RepromptRefinementResult {
                 original_text,
                 result,
+                generation,
             } => {
                 self.chat_widget
-                    .on_reprompt_refinement_result(original_text, result);
+                    .on_reprompt_refinement_result(original_text, result, generation);
             }
         }
         Ok(AppRunControl::Continue)

@@ -577,6 +577,7 @@ pub(crate) enum AppEvent {
     RepromptRefinementResult {
         original_text: String,
         result: crate::reprompt::RepromptResult,
+        generation: u64,
     },
 }
 

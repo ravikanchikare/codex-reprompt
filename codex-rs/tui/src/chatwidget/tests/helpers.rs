@@ -289,7 +289,8 @@ pub(super) async fn make_chatwidget_manual(
         last_non_retry_error: None,
         reprompt_config: crate::reprompt::RepromptConfig::default(),
         reprompt_overlay: None,
-        reprompt_original_text: None,
+        reprompt_original_message: None,
+        reprompt_generation: 0,
     };
     widget.set_model(&resolved_model);
     (widget, rx, op_rx)
