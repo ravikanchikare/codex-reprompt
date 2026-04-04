@@ -9,6 +9,9 @@
 use codex_login::default_client::build_reqwest_client;
 use serde_json::json;
 
+use super::RelevantAppPrompt;
+use super::RelevantPluginPrompt;
+use super::RelevantSkillPrompt;
 use super::RepromptConfig;
 use super::RepromptProfile;
 use super::RepromptResult;
@@ -48,9 +51,11 @@ Do NOT apply rules from other task types.
 4. Add verification steps where appropriate (tests, checks)
 5. Specify investigation order when applicable
 6. Include relevant context hints (files, modules)
-7. Preserve the user's intent EXACTLY -- do not add scope
-8. Keep it concise -- agents work best with clear, focused prompts
-9. If the input is already clear and specific, return it mostly unchanged
+7. Canonicalize file references when context identifies the exact path
+8. Canonicalize tool references when context identifies the exact skill, plugin, or app
+9. Preserve the user's intent EXACTLY -- do not add scope
+10. Keep it concise -- agents work best with clear, focused prompts
+11. If the input is already clear and specific, return it mostly unchanged
 
 ## Step 4: Generate tips
 After refining, generate 0-3 short tips about the ORIGINAL prompt.
@@ -77,6 +82,25 @@ user input. Use this context to:
 - Understand recently discussed files, functions, or patterns
 - Detect task continuity vs. topic changes
 The LAST user message is the one to refine. Prior messages are read-only context.
+
+## File and tool resolution
+The instructions may include relevant files, skills, plugins, and apps.
+- When the user references a file by a partial path, basename, or module name,
+  correct it to the exact relative path from the provided file hints and render
+  it as `@path/to/file.rs`.
+- When the user informally references a skill, plugin, or app, map it to the
+  exact visible token from the provided hints and render it as `$token`.
+- Use the recent conversation, candidate descriptions, and neighboring wording
+  to infer whether the user means a file, skill, plugin, or app.
+- Prefer auto-correcting near-misses (`token.rs`, `auth file`, `linter skill`,
+  `calendar app`) when one candidate is clearly supported by the context.
+- Use only candidates that are explicitly provided or strongly supported by the
+  recent conversation context.
+- Preserve the canonical token or path exactly once you resolve it. Do not
+  paraphrase, shorten, or rename a resolved reference.
+- Do not invent file paths, skill names, plugin names, or app tokens.
+- If multiple candidates are plausible, keep the user's wording instead of
+  forcing an uncertain resolution.
 
 ## Critical rule:
 If the user's input is already precise and well-structured, set
@@ -129,9 +153,128 @@ fn reprompt_result_json_schema() -> serde_json::Value {
     })
 }
 
+pub(crate) struct RefinementPromptContext<'a> {
+    pub conversation: &'a [super::thread_context::ContextTurn],
+    pub project_structure: Option<&'a str>,
+    pub relevant_files: &'a [String],
+    pub relevant_skills: &'a [RelevantSkillPrompt],
+    pub relevant_plugins: &'a [RelevantPluginPrompt],
+    pub relevant_apps: &'a [RelevantAppPrompt],
+    pub redaction_mappings: &'a [codex_secrets::RedactionMapping],
+}
+
 /// Build the system prompt by substituting placeholders.
-fn build_system_prompt(base_prompt: &str, reprompt_rules: &str) -> String {
-    base_prompt.replace("{reprompt_rules}", reprompt_rules)
+fn build_system_prompt(
+    base_prompt: &str,
+    reprompt_rules: &str,
+    prompt_context: &RefinementPromptContext<'_>,
+) -> String {
+    let mut prompt = base_prompt.replace("{reprompt_rules}", reprompt_rules);
+    append_prompt_section(
+        &mut prompt,
+        "## Relevant files",
+        prompt_context.relevant_files.to_vec(),
+    );
+    append_prompt_section(
+        &mut prompt,
+        "## Relevant skills",
+        prompt_context
+            .relevant_skills
+            .iter()
+            .map(RelevantSkillPrompt::render_line)
+            .collect(),
+    );
+    append_prompt_section(
+        &mut prompt,
+        "## Relevant plugins",
+        prompt_context
+            .relevant_plugins
+            .iter()
+            .map(RelevantPluginPrompt::render_line)
+            .collect(),
+    );
+    append_prompt_section(
+        &mut prompt,
+        "## Relevant apps",
+        prompt_context
+            .relevant_apps
+            .iter()
+            .map(RelevantAppPrompt::render_line)
+            .collect(),
+    );
+
+    if prompt_context.relevant_files.is_empty()
+        && let Some(project_structure) = prompt_context
+            .project_structure
+            .filter(|project_structure| !project_structure.trim().is_empty())
+    {
+        if !prompt.ends_with('\n') {
+            prompt.push('\n');
+        }
+        prompt.push_str(
+            r#"
+
+## Project structure
+The project tree below is read-only context. Use it to map vague references to
+real files or modules when possible. Do not invent paths that are not present.
+
+<project_structure>
+"#,
+        );
+        prompt.push_str(project_structure);
+        prompt.push_str("\n</project_structure>");
+    }
+    prompt
+}
+
+fn append_prompt_section(prompt: &mut String, heading: &str, lines: Vec<String>) {
+    if lines.is_empty() {
+        return;
+    }
+    if !prompt.ends_with('\n') {
+        prompt.push('\n');
+    }
+    prompt.push('\n');
+    prompt.push_str(heading);
+    prompt.push('\n');
+    for line in lines {
+        prompt.push_str(&line);
+        prompt.push('\n');
+    }
+}
+
+fn build_request_body(
+    model: &str,
+    prompt_for_model: &str,
+    system_prompt: &str,
+    context: &[super::thread_context::ContextTurn],
+    schema: &serde_json::Value,
+) -> serde_json::Value {
+    let mut input_messages: Vec<serde_json::Value> = Vec::new();
+    for turn in context {
+        let role = match turn.role {
+            super::thread_context::ContextRole::User => "user",
+            super::thread_context::ContextRole::Assistant => "assistant",
+        };
+        input_messages.push(json!({ "role": role, "content": turn.text }));
+    }
+    input_messages.push(json!({ "role": "user", "content": prompt_for_model }));
+
+    json!({
+        "model": model,
+        "input": input_messages,
+        "instructions": system_prompt,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "RepromptResult",
+                "strict": true,
+                "schema": schema["schema"]
+            }
+        },
+        "store": false,
+        "stream": true
+    })
 }
 
 /// Build a fallback `RepromptResult` that passes the original through unchanged.
@@ -146,6 +289,21 @@ fn fallback_result(original: &str) -> RepromptResult {
     }
 }
 
+fn finalize_result(
+    result: RepromptResult,
+    redaction_mappings: &[codex_secrets::RedactionMapping],
+) -> RepromptResult {
+    let refined_prompt = if redaction_mappings.is_empty() {
+        result.refined_prompt
+    } else {
+        codex_secrets::rehydrate_redacted_text(&result.refined_prompt, redaction_mappings)
+    };
+    RepromptResult {
+        refined_prompt,
+        ..result
+    }
+}
+
 /// Refine a user's input via an API call.
 ///
 /// This is a stateless, single-shot call — it is never part of the Codex
@@ -153,10 +311,11 @@ fn fallback_result(original: &str) -> RepromptResult {
 /// with `was_substantive_change = false`.
 pub(crate) async fn refine_input(
     original: &str,
+    prompt_for_model: &str,
     config: &RepromptConfig,
     auth: &super::RepromptAuthInfo,
     profile: &RepromptProfile,
-    context: &[super::thread_context::ContextTurn],
+    prompt_context: &RefinementPromptContext<'_>,
 ) -> anyhow::Result<RepromptResult> {
     let api_key = &auth.token;
     let base_url = &auth.base_url;
@@ -174,46 +333,30 @@ pub(crate) async fn refine_input(
         &config.model
     };
 
-    let system_prompt = build_system_prompt(base_prompt, &rules_text);
+    let system_prompt = build_system_prompt(base_prompt, &rules_text, prompt_context);
 
     tracing::debug!(
-        "REPROMPT: profile={}, model={}, rules={}, custom_system_prompt={}, context_turns={}, user_input={}",
+        "REPROMPT: profile={}, model={}, rules_chars={}, custom_system_prompt={}, context_turns={}, relevant_files={}, relevant_skills={}, relevant_plugins={}, relevant_apps={}, project_structure_chars={}",
         profile.name,
         model,
-        rules_text,
+        rules_text.len(),
         profile.system_prompt.is_some(),
-        context.len(),
-        original,
+        prompt_context.conversation.len(),
+        prompt_context.relevant_files.len(),
+        prompt_context.relevant_skills.len(),
+        prompt_context.relevant_plugins.len(),
+        prompt_context.relevant_apps.len(),
+        prompt_context.project_structure.map_or(0, str::len),
     );
-    tracing::debug!("REPROMPT SYSTEM PROMPT:\n{system_prompt}");
 
     let schema = reprompt_result_json_schema();
-
-    let mut input_messages: Vec<serde_json::Value> = Vec::new();
-    for turn in context {
-        let role = match turn.role {
-            super::thread_context::ContextRole::User => "user",
-            super::thread_context::ContextRole::Assistant => "assistant",
-        };
-        input_messages.push(json!({ "role": role, "content": turn.text }));
-    }
-    input_messages.push(json!({ "role": "user", "content": original }));
-
-    let request_body = json!({
-        "model": model,
-        "input": input_messages,
-        "instructions": system_prompt,
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "RepromptResult",
-                "strict": true,
-                "schema": schema["schema"]
-            }
-        },
-        "store": false,
-        "stream": true
-    });
+    let request_body = build_request_body(
+        model,
+        prompt_for_model,
+        &system_prompt,
+        prompt_context.conversation,
+        &schema,
+    );
 
     let client = build_reqwest_client();
     let mut req = client
@@ -302,12 +445,14 @@ pub(crate) async fn refine_input(
 
     match serde_json::from_str::<RepromptResult>(&output_text) {
         Ok(result) => {
+            let result = finalize_result(result, prompt_context.redaction_mappings);
             tracing::debug!(
-                "Reprompt refinement succeeded: substantive={}, task={}, reasoning={}, refined={}",
+                "Reprompt refinement succeeded: substantive={}, task={}, reasoning_chars={}, refined_chars={}, redactions={}",
                 result.was_substantive_change,
                 result.task_type,
-                result.reasoning,
-                result.refined_prompt,
+                result.reasoning.len(),
+                result.refined_prompt.len(),
+                prompt_context.redaction_mappings.len(),
             );
             Ok(result)
         }
@@ -322,6 +467,18 @@ pub(crate) async fn refine_input(
 mod tests {
     use super::*;
 
+    fn empty_prompt_context<'a>() -> RefinementPromptContext<'a> {
+        RefinementPromptContext {
+            conversation: &[],
+            project_structure: None,
+            relevant_files: &[],
+            relevant_skills: &[],
+            relevant_plugins: &[],
+            relevant_apps: &[],
+            redaction_mappings: &[],
+        }
+    }
+
     #[test]
     fn fallback_result_preserves_original() {
         let result = fallback_result("my original prompt");
@@ -332,15 +489,144 @@ mod tests {
 
     #[test]
     fn build_system_prompt_substitutes_placeholders() {
-        let prompt = build_system_prompt(REFINEMENT_SYSTEM_PROMPT, "always include tests");
+        let prompt = build_system_prompt(
+            REFINEMENT_SYSTEM_PROMPT,
+            "always include tests",
+            &empty_prompt_context(),
+        );
         assert!(prompt.contains("always include tests"));
     }
 
     #[test]
     fn build_system_prompt_with_empty_rules() {
-        let prompt = build_system_prompt(REFINEMENT_SYSTEM_PROMPT, "");
+        let prompt = build_system_prompt(REFINEMENT_SYSTEM_PROMPT, "", &empty_prompt_context());
         assert!(prompt.contains("Step 2: Apply rules"));
         assert!(!prompt.contains("{reprompt_rules}"));
+    }
+
+    #[test]
+    fn build_system_prompt_appends_project_structure() {
+        let prompt_context = RefinementPromptContext {
+            project_structure: Some("src/\n  main.rs"),
+            ..empty_prompt_context()
+        };
+        let prompt = build_system_prompt(REFINEMENT_SYSTEM_PROMPT, "", &prompt_context);
+
+        assert!(prompt.contains("## Project structure"));
+        assert!(prompt.contains("<project_structure>"));
+        assert!(prompt.contains("src/\n  main.rs"));
+        assert!(prompt.contains("</project_structure>"));
+    }
+
+    #[test]
+    fn build_system_prompt_includes_relevant_files_and_tools() {
+        let relevant_files = ["@src/auth/token.rs".to_string()];
+        let skills = [RelevantSkillPrompt {
+            token: "repo:linter".to_string(),
+            display_name: "Repo Linter".to_string(),
+            description: Some("Run linters across the repo".to_string()),
+            path: "/tmp/repo:linter/SKILL.md".into(),
+        }];
+        let plugins = [RelevantPluginPrompt {
+            token: "calendar".to_string(),
+            display_name: "Google Calendar".to_string(),
+            description: Some("Plugin for event automation".to_string()),
+            path: "plugin://calendar@debug".to_string(),
+        }];
+        let apps = [RelevantAppPrompt {
+            token: "google-calendar".to_string(),
+            display_name: "Google Calendar".to_string(),
+            description: Some("Check availability".to_string()),
+            path: "app://google_calendar".to_string(),
+        }];
+        let prompt_context = RefinementPromptContext {
+            relevant_files: &relevant_files,
+            relevant_skills: &skills,
+            relevant_plugins: &plugins,
+            relevant_apps: &apps,
+            ..empty_prompt_context()
+        };
+        let prompt = build_system_prompt(REFINEMENT_SYSTEM_PROMPT, "", &prompt_context);
+
+        assert!(prompt.contains("## Relevant files"));
+        assert!(prompt.contains("@src/auth/token.rs"));
+        assert!(prompt.contains("## Relevant skills"));
+        assert!(prompt.contains("$repo:linter"));
+        assert!(prompt.contains("## Relevant plugins"));
+        assert!(prompt.contains("$calendar"));
+        assert!(prompt.contains("## Relevant apps"));
+        assert!(prompt.contains("$google-calendar"));
+        assert!(!prompt.contains("## Project structure"));
+    }
+
+    #[test]
+    fn build_request_body_uses_redacted_prompt_and_instructions() {
+        let redaction = codex_secrets::redact_secrets_structured(
+            "use sk-abcdefghijklmnopqrstuvwxyz123456 for auth",
+            &Default::default(),
+        );
+        let schema = reprompt_result_json_schema();
+        let relevant_files = ["@src/auth.rs".to_string()];
+        let prompt_context = RefinementPromptContext {
+            project_structure: Some("src/\n  auth.rs"),
+            relevant_files: &relevant_files,
+            ..empty_prompt_context()
+        };
+        let instructions = build_system_prompt(REFINEMENT_SYSTEM_PROMPT, "rule", &prompt_context);
+        let body = build_request_body(
+            "o4-mini",
+            &redaction.redacted_text,
+            &instructions,
+            &[super::super::thread_context::ContextTurn {
+                role: super::super::thread_context::ContextRole::Assistant,
+                text: "Earlier answer".to_string(),
+            }],
+            &schema,
+        );
+
+        assert_eq!(body["model"], "o4-mini");
+        assert_eq!(body["input"].as_array().expect("input array").len(), 2);
+        assert_eq!(body["input"][0]["role"], "assistant");
+        assert_eq!(
+            body["input"][1]["content"],
+            serde_json::Value::String(redaction.redacted_text)
+        );
+        let instructions = body["instructions"].as_str().expect("instructions");
+        assert!(instructions.contains("## Relevant files"));
+        assert!(instructions.contains("@src/auth.rs"));
+        assert!(!instructions.contains("## Project structure"));
+    }
+
+    #[test]
+    fn finalize_result_rehydrates_only_refined_prompt() {
+        let redaction = codex_secrets::redact_secrets_structured(
+            "use sk-abcdefghijklmnopqrstuvwxyz123456 for auth",
+            &Default::default(),
+        );
+        let placeholder = redaction
+            .mappings
+            .first()
+            .expect("placeholder mapping")
+            .placeholder
+            .clone();
+        let result = finalize_result(
+            RepromptResult {
+                refined_prompt: format!("Apply config using {placeholder}"),
+                applied_rules: vec!["rule".to_string()],
+                reasoning: format!("Reason keeps {placeholder}"),
+                task_type: TaskType::Analysis,
+                was_substantive_change: true,
+                tips: vec![format!("Tip keeps {placeholder}")],
+            },
+            &redaction.mappings,
+        );
+
+        assert_eq!(
+            result.refined_prompt,
+            "Apply config using sk-abcdefghijklmnopqrstuvwxyz123456"
+        );
+        assert_eq!(result.reasoning, format!("Reason keeps {placeholder}"));
+        assert_eq!(result.tips, vec![format!("Tip keeps {placeholder}")]);
     }
 
     #[test]
@@ -363,10 +649,33 @@ mod tests {
             account_id: None,
         };
         let profile = RepromptProfile::default();
-        let result = refine_input("test prompt", &config, &auth, &profile, &[])
-            .await
-            .unwrap();
+        let prompt_context = empty_prompt_context();
+        let result = refine_input(
+            "test prompt",
+            "test prompt",
+            &config,
+            &auth,
+            &profile,
+            &prompt_context,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.refined_prompt, "test prompt");
         assert!(!result.was_substantive_change);
+    }
+
+    #[test]
+    fn build_request_body_omits_project_structure_when_none() {
+        let schema = reprompt_result_json_schema();
+        let instructions = build_system_prompt(
+            "Custom prompt {reprompt_rules}",
+            "rule",
+            &empty_prompt_context(),
+        );
+        let body = build_request_body("o4-mini", "simple prompt", &instructions, &[], &schema);
+
+        let instructions = body["instructions"].as_str().expect("instructions");
+        assert!(instructions.starts_with("Custom prompt rule"));
+        assert!(!instructions.contains("## Project structure"));
     }
 }

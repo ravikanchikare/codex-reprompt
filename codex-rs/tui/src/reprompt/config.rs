@@ -105,6 +105,82 @@ pub(crate) struct RepromptConfig {
     /// Maximum number of prior conversation turns to include as context
     /// for the refinement model. `0` disables context.
     pub context_turns: usize,
+
+    /// Whether to inject a matched list of relevant project files into the
+    /// refinement instructions.
+    pub include_relevant_files: bool,
+
+    /// Maximum number of matched file candidates to include in the prompt.
+    pub relevant_files_max_count: usize,
+
+    /// Maximum number of characters to spend on relevant file candidates.
+    pub relevant_files_max_chars: usize,
+
+    /// Whether to inject a matched list of relevant skills into the
+    /// refinement instructions.
+    pub include_relevant_skills: bool,
+
+    /// Maximum number of matched skill candidates to include in the prompt.
+    pub relevant_skills_max_count: usize,
+
+    /// Maximum number of characters to spend on relevant skill candidates.
+    pub relevant_skills_max_chars: usize,
+
+    /// Whether to inject a matched list of relevant plugins into the
+    /// refinement instructions.
+    pub include_relevant_plugins: bool,
+
+    /// Maximum number of matched plugin candidates to include in the prompt.
+    pub relevant_plugins_max_count: usize,
+
+    /// Maximum number of characters to spend on relevant plugin candidates.
+    pub relevant_plugins_max_chars: usize,
+
+    /// Whether to inject a matched list of relevant apps into the refinement
+    /// instructions.
+    pub include_relevant_apps: bool,
+
+    /// Maximum number of matched app candidates to include in the prompt.
+    pub relevant_apps_max_count: usize,
+
+    /// Maximum number of characters to spend on relevant app candidates.
+    pub relevant_apps_max_chars: usize,
+
+    /// Whether to append a filtered project structure summary to the
+    /// refinement instructions.
+    pub include_project_structure: bool,
+
+    /// Maximum directory depth to include in the project structure summary.
+    pub project_structure_max_depth: usize,
+
+    /// Maximum number of characters to include in the project structure
+    /// summary. Additional content is truncated.
+    pub project_structure_max_chars: usize,
+
+    /// How long project structure summaries stay cached, in seconds.
+    pub project_structure_cache_ttl_secs: u64,
+
+    /// Additional glob/path fragments to exclude from the project structure
+    /// summary.
+    pub project_structure_extra_excludes: Vec<String>,
+
+    /// Whether to redact secrets before sending the prompt to the reprompt
+    /// refinement model.
+    pub redact_secrets: bool,
+
+    /// Whether to apply the high-entropy fallback detector after known secret
+    /// patterns.
+    pub redact_high_entropy: bool,
+
+    /// Minimum Shannon entropy to consider a token secret-like.
+    pub redaction_entropy_threshold: f64,
+
+    /// Minimum token length for entropy-based secret detection.
+    pub redaction_min_length: usize,
+
+    /// Whether refined `@...` and `$...` mentions should be reparsed into
+    /// structured file/tool inputs before submission.
+    pub reparse_refined_mentions: bool,
 }
 
 impl Default for RepromptConfig {
@@ -117,6 +193,28 @@ impl Default for RepromptConfig {
             show_diff: false,
             auto_accept_delay: Duration::from_secs(15),
             context_turns: 4,
+            include_relevant_files: true,
+            relevant_files_max_count: 8,
+            relevant_files_max_chars: 600,
+            include_relevant_skills: true,
+            relevant_skills_max_count: 5,
+            relevant_skills_max_chars: 600,
+            include_relevant_plugins: true,
+            relevant_plugins_max_count: 4,
+            relevant_plugins_max_chars: 400,
+            include_relevant_apps: true,
+            relevant_apps_max_count: 4,
+            relevant_apps_max_chars: 400,
+            include_project_structure: true,
+            project_structure_max_depth: 4,
+            project_structure_max_chars: 2_000,
+            project_structure_cache_ttl_secs: 30,
+            project_structure_extra_excludes: Vec::new(),
+            redact_secrets: true,
+            redact_high_entropy: true,
+            redaction_entropy_threshold: 4.5,
+            redaction_min_length: 24,
+            reparse_refined_mentions: true,
         }
     }
 }
@@ -310,6 +408,28 @@ mod tests {
         assert!(!config.show_diff);
         assert_eq!(config.auto_accept_delay, Duration::from_secs(15));
         assert_eq!(config.context_turns, 4);
+        assert!(config.include_relevant_files);
+        assert_eq!(config.relevant_files_max_count, 8);
+        assert_eq!(config.relevant_files_max_chars, 600);
+        assert!(config.include_relevant_skills);
+        assert_eq!(config.relevant_skills_max_count, 5);
+        assert_eq!(config.relevant_skills_max_chars, 600);
+        assert!(config.include_relevant_plugins);
+        assert_eq!(config.relevant_plugins_max_count, 4);
+        assert_eq!(config.relevant_plugins_max_chars, 400);
+        assert!(config.include_relevant_apps);
+        assert_eq!(config.relevant_apps_max_count, 4);
+        assert_eq!(config.relevant_apps_max_chars, 400);
+        assert!(config.include_project_structure);
+        assert_eq!(config.project_structure_max_depth, 4);
+        assert_eq!(config.project_structure_max_chars, 2_000);
+        assert_eq!(config.project_structure_cache_ttl_secs, 30);
+        assert!(config.project_structure_extra_excludes.is_empty());
+        assert!(config.redact_secrets);
+        assert!(config.redact_high_entropy);
+        assert_eq!(config.redaction_entropy_threshold, 4.5);
+        assert_eq!(config.redaction_min_length, 24);
+        assert!(config.reparse_refined_mentions);
         assert!(config.profile_name.is_none());
     }
 

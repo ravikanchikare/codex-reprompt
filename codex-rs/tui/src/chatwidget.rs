@@ -967,6 +967,10 @@ pub(crate) struct ChatWidget {
     reprompt_generation: u64,
     /// Ring buffer of recent conversation turns for reprompt context.
     reprompt_context_buffer: crate::reprompt::ThreadContextBuffer,
+    /// Cached project-structure summaries used by `/reprompt`.
+    reprompt_project_context_cache: crate::reprompt::ProjectContextCache,
+    /// Structured resolution context for the current or iterated reprompt text.
+    reprompt_resolution_context: Option<crate::reprompt::RepromptResolutionContext>,
 }
 
 /// Cached nickname and role for a collab agent thread, used to attach human-readable labels to
@@ -1950,6 +1954,8 @@ impl ChatWidget {
         self.session_network_proxy = event.network_proxy.clone();
         self.thread_id = Some(event.session_id);
         self.reprompt_context_buffer.clear();
+        self.reprompt_project_context_cache.clear();
+        self.reprompt_resolution_context = None;
         self.thread_name = event.thread_name.clone();
         self.forked_from = event.forked_from_id;
         self.current_rollout_path = event.rollout_path.clone();
@@ -3118,7 +3124,7 @@ impl ChatWidget {
         } = user_message;
         let local_image_paths = local_images.into_iter().map(|img| img.path).collect();
         self.set_remote_image_urls(remote_image_urls);
-        self.bottom_pane.set_composer_text_with_mention_bindings(
+        self.set_composer_text_with_mention_bindings(
             text,
             text_elements,
             local_image_paths,
@@ -3166,7 +3172,7 @@ impl ChatWidget {
                     .map(|img| img.path)
                     .collect();
                 self.set_remote_image_urls(composer.remote_image_urls);
-                self.bottom_pane.set_composer_text_with_mention_bindings(
+                self.set_composer_text_with_mention_bindings(
                     composer.text,
                     composer.text_elements,
                     local_image_paths,
@@ -3176,7 +3182,7 @@ impl ChatWidget {
                     .set_composer_pending_pastes(composer.pending_pastes);
             } else {
                 self.set_remote_image_urls(Vec::new());
-                self.bottom_pane.set_composer_text_with_mention_bindings(
+                self.set_composer_text_with_mention_bindings(
                     String::new(),
                     Vec::new(),
                     Vec::new(),
@@ -3203,7 +3209,7 @@ impl ChatWidget {
             self.pending_steers.clear();
             self.rejected_steers_queue.clear();
             self.set_remote_image_urls(Vec::new());
-            self.bottom_pane.set_composer_text_with_mention_bindings(
+            self.set_composer_text_with_mention_bindings(
                 String::new(),
                 Vec::new(),
                 Vec::new(),
@@ -4742,20 +4748,12 @@ impl ChatWidget {
                 {
                     rc.enabled = true;
                     rc.profile_name = Some(profile.to_string());
-                    let prof = crate::reprompt::profile_config::load_reprompt_profile(
-                        &codex_home_for_reprompt,
-                        profile,
-                    );
-                    rc.model = prof.model;
-                    if let Some(min_length) = prof.min_length {
-                        rc.min_length = min_length;
-                    }
-                    if let Some(secs) = prof.auto_accept_delay_secs {
-                        rc.auto_accept_delay = std::time::Duration::from_secs(secs);
-                    }
-                    if let Some(ct) = prof.context_turns {
-                        rc.context_turns = ct;
-                    }
+                    let (_, effective) =
+                        crate::reprompt::profile_config::resolve_effective_reprompt_config(
+                            &codex_home_for_reprompt,
+                            &rc,
+                        );
+                    rc = effective;
                 }
                 rc
             },
@@ -4763,6 +4761,8 @@ impl ChatWidget {
             reprompt_original_message: None,
             reprompt_generation: 0,
             reprompt_context_buffer: crate::reprompt::ThreadContextBuffer::new(10),
+            reprompt_project_context_cache: crate::reprompt::ProjectContextCache::new(),
+            reprompt_resolution_context: None,
         };
 
         widget
@@ -4936,6 +4936,7 @@ impl ChatWidget {
 
                         // ── /reprompt interception ──────────────────────
                         if self.reprompt_config.enabled
+                            && self.reprompt_resolution_context.is_none()
                             && user_message.text.len() >= self.reprompt_config.min_length
                             && !user_message.text.starts_with('/')
                         {
@@ -5671,6 +5672,7 @@ impl ChatWidget {
                 )));
                 return;
             }
+            self.reprompt_resolution_context = None;
             self.submit_op(AppCommand::run_user_shell_command(cmd.to_string()));
             return;
         }
@@ -5694,6 +5696,13 @@ impl ChatWidget {
             });
         }
 
+        let reprompt_resolved = self
+            .reprompt_resolution_context
+            .as_ref()
+            .map_or_else(crate::reprompt::ResolvedRepromptInput::default, |context| {
+                context.resolve_text(&text)
+            });
+
         let mentions = collect_tool_mentions(&text, &HashMap::new());
         let bound_names: HashSet<String> = mention_bindings
             .iter()
@@ -5702,12 +5711,23 @@ impl ChatWidget {
         let mut skill_names_lower: HashSet<String> = HashSet::new();
         let mut selected_skill_paths: HashSet<PathBuf> = HashSet::new();
         let mut selected_plugin_ids: HashSet<String> = HashSet::new();
+        let mut selected_app_ids: HashSet<String> = HashSet::new();
+        let mut selected_file_paths: HashSet<String> = HashSet::new();
 
         if let Some(skills) = self.bottom_pane.skills() {
             skill_names_lower = skills
                 .iter()
                 .map(|skill| skill.name.to_ascii_lowercase())
                 .collect();
+
+            for skill in &reprompt_resolved.skills {
+                if selected_skill_paths.insert(skill.path.clone()) {
+                    items.push(UserInput::Skill {
+                        name: skill.name.clone(),
+                        path: skill.path.clone(),
+                    });
+                }
+            }
 
             for binding in &mention_bindings {
                 let path = binding
@@ -5742,6 +5762,27 @@ impl ChatWidget {
         }
 
         if let Some(plugins) = self.plugins_for_mentions() {
+            for mention in reprompt_resolved
+                .mentions
+                .iter()
+                .filter(|mention| mention.path.starts_with("plugin://"))
+            {
+                let Some(plugin_config_name) = mention
+                    .path
+                    .strip_prefix("plugin://")
+                    .filter(|id| !id.is_empty())
+                else {
+                    continue;
+                };
+                if !selected_plugin_ids.insert(plugin_config_name.to_string()) {
+                    continue;
+                }
+                items.push(UserInput::Mention {
+                    name: mention.name.clone(),
+                    path: mention.path.clone(),
+                });
+            }
+
             for binding in &mention_bindings {
                 let Some(plugin_config_name) = binding
                     .path
@@ -5765,8 +5806,28 @@ impl ChatWidget {
             }
         }
 
-        let mut selected_app_ids: HashSet<String> = HashSet::new();
         if let Some(apps) = self.connectors_for_mentions() {
+            for mention in reprompt_resolved
+                .mentions
+                .iter()
+                .filter(|mention| mention.path.starts_with("app://"))
+            {
+                let Some(app_id) = mention
+                    .path
+                    .strip_prefix("app://")
+                    .filter(|id| !id.is_empty())
+                else {
+                    continue;
+                };
+                if !selected_app_ids.insert(app_id.to_string()) {
+                    continue;
+                }
+                items.push(UserInput::Mention {
+                    name: mention.name.clone(),
+                    path: mention.path.clone(),
+                });
+            }
+
             for binding in &mention_bindings {
                 let Some(app_id) = binding
                     .path
@@ -5786,7 +5847,12 @@ impl ChatWidget {
                 }
             }
 
-            let app_mentions = find_app_mentions(&mentions, apps, &skill_names_lower);
+            let app_mentions = find_app_mentions(
+                &mentions,
+                apps,
+                &skill_names_lower,
+                &reprompt_resolved.tool_tokens,
+            );
             for app in app_mentions {
                 let slug = codex_core::connectors::connector_mention_slug(&app);
                 if bound_names.contains(&slug) || !selected_app_ids.insert(app.id.clone()) {
@@ -5796,6 +5862,17 @@ impl ChatWidget {
                 items.push(UserInput::Mention {
                     name: app.name.clone(),
                     path: format!("app://{app_id}"),
+                });
+            }
+        }
+
+        for mention in reprompt_resolved.mentions.iter().filter(|mention| {
+            !mention.path.starts_with("plugin://") && !mention.path.starts_with("app://")
+        }) {
+            if selected_file_paths.insert(mention.path.clone()) {
+                items.push(UserInput::Mention {
+                    name: mention.name.clone(),
+                    path: mention.path.clone(),
                 });
             }
         }
@@ -5847,6 +5924,7 @@ impl ChatWidget {
         if !self.submit_op(op) {
             return;
         }
+        self.reprompt_resolution_context = None;
 
         // Persist the text to cross-session message history. Mentions are
         // encoded into placeholder syntax so recall can reconstruct the
@@ -5924,13 +6002,15 @@ impl ChatWidget {
     ) {
         // Preserve the user's composed payload so they can retry after changing models.
         let local_image_paths = local_images.iter().map(|img| img.path.clone()).collect();
+        let reprompt_resolution_context = self.reprompt_resolution_context.clone();
         self.set_remote_image_urls(remote_image_urls);
-        self.bottom_pane.set_composer_text_with_mention_bindings(
+        self.set_composer_text_with_mention_bindings(
             text,
             text_elements,
             local_image_paths,
             mention_bindings,
         );
+        self.reprompt_resolution_context = reprompt_resolution_context;
         self.add_to_history(history_cell::new_warning_event(
             self.image_inputs_not_supported_message(),
         ));
@@ -10432,8 +10512,25 @@ impl ChatWidget {
         text_elements: Vec<TextElement>,
         local_image_paths: Vec<PathBuf>,
     ) {
+        self.reprompt_resolution_context = None;
         self.bottom_pane
             .set_composer_text(text, text_elements, local_image_paths);
+    }
+
+    fn set_composer_text_with_mention_bindings(
+        &mut self,
+        text: String,
+        text_elements: Vec<TextElement>,
+        local_image_paths: Vec<PathBuf>,
+        mention_bindings: Vec<MentionBinding>,
+    ) {
+        self.reprompt_resolution_context = None;
+        self.bottom_pane.set_composer_text_with_mention_bindings(
+            text,
+            text_elements,
+            local_image_paths,
+            mention_bindings,
+        );
     }
 
     pub(crate) fn set_remote_image_urls(&mut self, remote_image_urls: Vec<String>) {
@@ -11076,6 +11173,7 @@ impl ChatWidget {
         let original_text = message.text.clone();
         self.flush_answer_stream_with_separator();
         self.clear_reprompt_loading_if_active();
+        self.reprompt_resolution_context = None;
 
         // If there's an in-flight reprompt, submit its original message now
         // so it isn't silently dropped when we overwrite the slot.
@@ -11106,20 +11204,16 @@ impl ChatWidget {
         let generation = self.reprompt_generation;
         self.reprompt_original_message = Some(message);
 
-        let mut config = self.reprompt_config.clone();
-        let profile_name = config
-            .profile_name
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
-        let mut profile = crate::reprompt::profile_config::load_reprompt_profile(
-            &self.config.codex_home,
-            &profile_name,
-        );
+        let (mut profile, mut config) =
+            crate::reprompt::profile_config::resolve_effective_reprompt_config(
+                &self.config.codex_home,
+                &self.reprompt_config,
+            );
 
         // When using the ChatGPT proxy, the default o4-mini model is not
         // supported. Fall back to the session's configured model instead.
         let is_chatgpt_proxy = auth.base_url.contains("chatgpt.com");
-        if is_chatgpt_proxy && profile.model == "o4-mini" {
+        if is_chatgpt_proxy && config.model == "o4-mini" {
             let session_model = self
                 .config
                 .model
@@ -11128,19 +11222,106 @@ impl ChatWidget {
             profile.model = session_model.clone();
             config.model = session_model;
         }
-        let effective_context_turns = profile.context_turns.unwrap_or(config.context_turns);
         let context = self
             .reprompt_context_buffer
-            .recent(effective_context_turns, 4000);
+            .recent(config.context_turns, 4000);
+        let available_skills = self.bottom_pane.skills().cloned().unwrap_or_default();
+        let available_plugins = self.plugins_for_mentions().map_or_else(
+            Vec::new,
+            <[codex_core::plugins::PluginCapabilitySummary]>::to_vec,
+        );
+        let available_apps = self
+            .connectors_for_mentions()
+            .map_or_else(Vec::new, <[codex_app_server_protocol::AppInfo]>::to_vec);
+        let project_context_options = crate::reprompt::ProjectContextOptions {
+            enabled: config.include_project_structure
+                || config.include_relevant_files
+                || config.reparse_refined_mentions,
+            max_depth: config.project_structure_max_depth,
+            max_chars: config.project_structure_max_chars,
+            cache_ttl: std::time::Duration::from_secs(config.project_structure_cache_ttl_secs),
+            extra_excludes: config.project_structure_extra_excludes.clone(),
+        };
+        let project_context = self
+            .reprompt_project_context_cache
+            .get_or_build(self.config.cwd.as_path(), &project_context_options);
+        let relevant_context = crate::reprompt::relevant_context::build_relevant_prompt_context(
+            &original_text,
+            project_context.snapshot.as_ref(),
+            &available_skills,
+            &available_plugins,
+            &available_apps,
+            &config,
+        );
+        self.reprompt_resolution_context = config
+            .reparse_refined_mentions
+            .then(|| {
+                crate::reprompt::relevant_context::build_resolution_context(
+                    project_context.snapshot.as_ref(),
+                    &available_skills,
+                    &available_plugins,
+                    &available_apps,
+                )
+            })
+            .filter(|context| !context.is_empty());
+        let redaction = if config.redact_secrets {
+            Some(codex_secrets::redact_secrets_structured(
+                &original_text,
+                &codex_secrets::SecretRedactionOptions {
+                    redact_high_entropy: config.redact_high_entropy,
+                    entropy_threshold: config.redaction_entropy_threshold,
+                    min_entropy_length: config.redaction_min_length,
+                },
+            ))
+        } else {
+            None
+        };
+        tracing::debug!(
+            "REPROMPT: context_turns={}, relevant_files={}, relevant_skills={}, relevant_plugins={}, relevant_apps={}, project_context_enabled={}, project_context_chars={}, project_context_cache_hit={}, reparse_refined_mentions={}, redact_secrets={}, redact_high_entropy={}, redaction_count={}",
+            context.len(),
+            relevant_context.files.len(),
+            relevant_context.skills.len(),
+            relevant_context.plugins.len(),
+            relevant_context.apps.len(),
+            config.include_project_structure,
+            project_context.context.as_ref().map_or(0, String::len),
+            project_context.cache_hit,
+            config.reparse_refined_mentions,
+            config.redact_secrets,
+            config.redact_high_entropy,
+            redaction
+                .as_ref()
+                .map_or(0, |result| result.redaction_count),
+        );
 
         let tx = self.app_event_tx.clone();
+        let project_context_text = (config.include_project_structure
+            && !config.include_relevant_files)
+            .then_some(project_context.context)
+            .flatten();
+        let prompt_for_model = redaction.as_ref().map_or_else(
+            || original_text.clone(),
+            |result| result.redacted_text.clone(),
+        );
         tokio::spawn(async move {
+            let prompt_context = crate::reprompt::refinement::RefinementPromptContext {
+                conversation: &context,
+                project_structure: project_context_text.as_deref(),
+                relevant_files: &relevant_context.files,
+                relevant_skills: &relevant_context.skills,
+                relevant_plugins: &relevant_context.plugins,
+                relevant_apps: &relevant_context.apps,
+                redaction_mappings: redaction
+                    .as_ref()
+                    .map_or(&[], |result| result.mappings.as_slice()),
+            };
             let result = crate::reprompt::refinement::refine_input(
                 &original_text,
+                &prompt_for_model,
                 &config,
                 &auth,
                 &profile,
-                &context,
+                &prompt_context,
             )
             .await
             .unwrap_or_else(|_| crate::reprompt::RepromptResult {
@@ -11183,7 +11364,17 @@ impl ChatWidget {
         // Clear offset-dependent metadata that would be stale after text rewrite.
         message.text_elements.clear();
         message.mention_bindings.clear();
+        if !self.reprompt_config.reparse_refined_mentions {
+            self.reprompt_resolution_context = None;
+        }
         self.submit_user_message(message);
+    }
+
+    fn submit_original_after_reprompt(&mut self) {
+        self.reprompt_resolution_context = None;
+        if let Some(message) = self.reprompt_original_message.take() {
+            self.submit_user_message(message);
+        }
     }
 
     /// Resolve authentication credentials for the reprompt refinement API call.
@@ -11346,7 +11537,8 @@ impl ChatWidget {
                 "* re:prompt: no significant changes — submitting original.".to_string(),
                 /*hint*/ None,
             );
-            self.submit_text_after_reprompt(original_text);
+            let _ = original_text;
+            self.submit_original_after_reprompt();
             return;
         }
         let overlay_data = crate::reprompt::RepromptOverlayData::new(
@@ -11387,6 +11579,7 @@ impl ChatWidget {
                 true
             }
             crate::reprompt::RepromptOverlayAction::Iterate(text) => {
+                let reprompt_resolution_context = self.reprompt_resolution_context.clone();
                 let (local_image_paths, remote_image_urls) = self
                     .reprompt_original_message
                     .take()
@@ -11404,21 +11597,18 @@ impl ChatWidget {
                 self.reprompt_overlay = None;
                 self.set_remote_image_urls(remote_image_urls);
                 self.set_composer_text(text, Vec::new(), local_image_paths);
+                self.reprompt_resolution_context = reprompt_resolution_context;
                 true
             }
             crate::reprompt::RepromptOverlayAction::Skip => {
-                let original = self
-                    .reprompt_original_message
-                    .as_ref()
-                    .map(|m| m.text.clone())
-                    .unwrap_or_default();
                 self.reprompt_overlay = None;
-                self.submit_text_after_reprompt(original);
+                self.submit_original_after_reprompt();
                 true
             }
             crate::reprompt::RepromptOverlayAction::Cancel => {
                 self.reprompt_overlay = None;
                 self.reprompt_original_message = None;
+                self.reprompt_resolution_context = None;
                 true
             }
             crate::reprompt::RepromptOverlayAction::ShowReasoning => {
@@ -11491,25 +11681,22 @@ impl ChatWidget {
 
     /// Update the reprompt profile selection from an app event.
     pub(crate) fn set_reprompt_profile(&mut self, profile: Option<String>) {
+        self.reprompt_project_context_cache.clear();
+        self.reprompt_resolution_context = None;
         match profile {
             Some(name) => {
-                let prof = crate::reprompt::profile_config::load_reprompt_profile(
-                    &self.config.codex_home,
-                    &name,
-                );
+                let base = crate::reprompt::RepromptConfig {
+                    enabled: true,
+                    profile_name: Some(name),
+                    ..crate::reprompt::RepromptConfig::default()
+                };
+                let (prof, effective) =
+                    crate::reprompt::profile_config::resolve_effective_reprompt_config(
+                        &self.config.codex_home,
+                        &base,
+                    );
+                self.reprompt_config = effective;
                 self.reprompt_config.enabled = true;
-                self.reprompt_config.profile_name = Some(name);
-                // Store the profile's model; spawn_reprompt_refinement will
-                // override with the session model when on the ChatGPT proxy.
-                self.reprompt_config.model = prof.model;
-                let defaults = crate::reprompt::RepromptConfig::default();
-                self.reprompt_config.min_length = prof.min_length.unwrap_or(defaults.min_length);
-                self.reprompt_config.auto_accept_delay = prof
-                    .auto_accept_delay_secs
-                    .map(std::time::Duration::from_secs)
-                    .unwrap_or(defaults.auto_accept_delay);
-                self.reprompt_config.context_turns =
-                    prof.context_turns.unwrap_or(defaults.context_turns);
                 let display_model = if self.reprompt_config.model == "o4-mini" {
                     self.config
                         .model
