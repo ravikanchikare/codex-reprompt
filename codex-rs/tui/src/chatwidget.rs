@@ -971,6 +971,8 @@ pub(crate) struct ChatWidget {
     reprompt_project_context_cache: crate::reprompt::ProjectContextCache,
     /// Structured resolution context for the current or iterated reprompt text.
     reprompt_resolution_context: Option<crate::reprompt::RepromptResolutionContext>,
+    /// Active `/reprompt-insights` overlay (if any).
+    insights_overlay: Option<crate::reprompt::insights::overlay::InsightsOverlay>,
 }
 
 /// Cached nickname and role for a collab agent thread, used to attach human-readable labels to
@@ -4763,6 +4765,7 @@ impl ChatWidget {
             reprompt_context_buffer: crate::reprompt::ThreadContextBuffer::new(10),
             reprompt_project_context_cache: crate::reprompt::ProjectContextCache::new(),
             reprompt_resolution_context: None,
+            insights_overlay: None,
         };
 
         widget
@@ -5350,6 +5353,9 @@ impl ChatWidget {
             }
             SlashCommand::Reprompt => {
                 self.open_reprompt_profile_picker();
+            }
+            SlashCommand::RepromptInsights => {
+                self.open_reprompt_insights();
             }
             SlashCommand::Mcp => {
                 self.add_mcp_output();
@@ -11574,6 +11580,7 @@ impl ChatWidget {
         let action = overlay.handle_key(key);
         match action {
             crate::reprompt::RepromptOverlayAction::Accept(text) => {
+                self.persist_reprompt_entry_if_needed();
                 self.reprompt_overlay = None;
                 self.submit_text_after_reprompt(text);
                 true
@@ -11601,6 +11608,7 @@ impl ChatWidget {
                 true
             }
             crate::reprompt::RepromptOverlayAction::Skip => {
+                self.persist_reprompt_entry_if_needed();
                 self.reprompt_overlay = None;
                 self.submit_original_after_reprompt();
                 true
@@ -11636,6 +11644,7 @@ impl ChatWidget {
     pub(crate) fn tick_reprompt_overlay(&mut self) {
         if let Some(overlay) = self.reprompt_overlay.as_mut() {
             if let Some(crate::reprompt::RepromptOverlayAction::Accept(text)) = overlay.tick() {
+                self.persist_reprompt_entry_if_needed();
                 self.reprompt_overlay = None;
                 self.submit_text_after_reprompt(text);
                 return;
@@ -11719,6 +11728,152 @@ impl ChatWidget {
                 self.add_info_message("* re:prompt: disabled".to_string(), /*hint*/ None);
             }
         }
+    }
+
+    /// Persist the current reprompt overlay data as a refinement entry for
+    /// `/reprompt-insights` analysis. Fire-and-forget: errors are logged but
+    /// never block the UI.
+    fn persist_reprompt_entry_if_needed(&self) {
+        let Some(overlay) = self.reprompt_overlay.as_ref() else {
+            return;
+        };
+        let data = overlay.data();
+        if !data.result.was_substantive_change {
+            return;
+        }
+        let entry = crate::reprompt::insights::RefinementEntry {
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            original_prompt: data.original.clone(),
+            result: data.result.clone(),
+            project_path: Some(self.config.cwd.display().to_string()),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = crate::reprompt::insights::storage::persist_entry(&entry) {
+                tracing::warn!("Failed to persist reprompt entry: {e}");
+            }
+        });
+    }
+
+    /// Whether an insights overlay is currently displayed.
+    pub(crate) fn has_insights_overlay(&self) -> bool {
+        self.insights_overlay.is_some()
+    }
+
+    /// Handle key events when the insights overlay is active. Returns true if consumed.
+    pub(crate) fn handle_insights_overlay_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        let Some(overlay) = self.insights_overlay.as_mut() else {
+            return false;
+        };
+
+        if key.kind == crossterm::event::KeyEventKind::Press
+            && key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+            && matches!(key.code, crossterm::event::KeyCode::Char('c' | 'C'))
+        {
+            overlay.on_ctrl_c();
+            self.insights_overlay = None;
+            return false;
+        }
+
+        let action = overlay.handle_key(key);
+        match action {
+            crate::reprompt::insights::overlay::InsightsOverlayAction::Dismiss => {
+                self.insights_overlay = None;
+                true
+            }
+            crate::reprompt::insights::overlay::InsightsOverlayAction::None => {
+                self.frame_requester.schedule_frame();
+                true
+            }
+        }
+    }
+
+    /// Render the insights overlay into the given area.
+    pub(crate) fn render_insights_overlay(
+        &self,
+        area: ratatui::layout::Rect,
+        buf: &mut ratatui::buffer::Buffer,
+    ) -> Option<u16> {
+        use ratatui::style::Color;
+        use ratatui::style::Style;
+        use ratatui::widgets::Clear;
+        use ratatui::widgets::Widget;
+
+        let overlay = self.insights_overlay.as_ref()?;
+
+        Clear.render(area, buf);
+        for row in area.y..area.y.saturating_add(area.height) {
+            for col in area.x..area.x.saturating_add(area.width) {
+                if let Some(cell) = buf.cell_mut((col, row)) {
+                    cell.set_style(Style::default().bg(Color::Black));
+                }
+            }
+        }
+
+        overlay.render_widget(area, buf);
+        Some(area.height)
+    }
+
+    /// Open the `/reprompt-insights` analysis overlay.
+    pub(crate) fn open_reprompt_insights(&mut self) {
+        let entries = match crate::reprompt::insights::storage::load_entries(50) {
+            Ok(entries) => entries,
+            Err(e) => {
+                self.add_info_message(
+                    format!("* re:prompt insights: failed to load history: {e}"),
+                    /*hint*/ None,
+                );
+                return;
+            }
+        };
+
+        if entries.is_empty() {
+            self.add_info_message(
+                "* re:prompt insights: no refinement history yet. Use /reprompt to start refining prompts.".to_string(),
+                /*hint*/ None,
+            );
+            return;
+        }
+
+        let count = entries.len();
+        self.add_info_message(
+            format!("* re:prompt insights: analyzing {count} refinement(s)..."),
+            /*hint*/ None,
+        );
+
+        // Resolve auth and model for the insights API call.
+        let Some(auth) = self.resolve_reprompt_auth() else {
+            self.add_info_message(
+                "* re:prompt insights: no API credentials available. Log in or set OPENAI_API_KEY."
+                    .to_string(),
+                /*hint*/ None,
+            );
+            return;
+        };
+        let model = self.reprompt_config.model.clone();
+        let tx = self.app_event_tx.clone();
+
+        tokio::spawn(async move {
+            let result =
+                crate::reprompt::insights::analysis::generate_insights(&entries, &auth, &model)
+                    .await;
+            tx.send(crate::app_event::AppEvent::RepromptInsightsResult(result));
+        });
+    }
+
+    /// Handle the async insights result and show the overlay.
+    pub(crate) fn on_reprompt_insights_result(
+        &mut self,
+        result: crate::reprompt::insights::InsightsResult,
+    ) {
+        self.insights_overlay = Some(crate::reprompt::insights::overlay::InsightsOverlay::new(
+            result,
+        ));
+        self.frame_requester.schedule_frame();
     }
 }
 

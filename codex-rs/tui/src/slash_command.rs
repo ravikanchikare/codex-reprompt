@@ -60,6 +60,8 @@ pub enum SlashCommand {
     #[strum(serialize = "subagents")]
     MultiAgents,
     Reprompt,
+    #[strum(serialize = "reprompt-insights")]
+    RepromptInsights,
     // Debugging commands.
     #[strum(serialize = "debug-m-drop")]
     MemoryDrop,
@@ -117,6 +119,9 @@ impl SlashCommand {
             SlashCommand::Rollout => "print the rollout file path",
             SlashCommand::TestApproval => "test approval request",
             SlashCommand::Reprompt => "toggle /reprompt prompt refinement on/off",
+            SlashCommand::RepromptInsights => {
+                "analyze your prompting patterns from refinement history"
+            }
         }
     }
 
@@ -162,7 +167,8 @@ impl SlashCommand {
             | SlashCommand::Logout
             | SlashCommand::MemoryDrop
             | SlashCommand::MemoryUpdate
-            | SlashCommand::Reprompt => false,
+            | SlashCommand::Reprompt
+            | SlashCommand::RepromptInsights => false,
             SlashCommand::Diff
             | SlashCommand::Copy
             | SlashCommand::Rename

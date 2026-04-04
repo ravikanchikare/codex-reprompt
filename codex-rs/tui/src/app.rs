@@ -3991,6 +3991,8 @@ impl App {
                             self.chat_widget.render(frame.area(), frame.buffer);
                             self.chat_widget
                                 .render_reprompt_overlay(frame.area(), frame.buffer);
+                            self.chat_widget
+                                .render_insights_overlay(frame.area(), frame.buffer);
                             if let Some((x, y)) = self.chat_widget.cursor_pos(frame.area()) {
                                 frame.set_cursor_position((x, y));
                             }
@@ -5543,6 +5545,9 @@ impl App {
                 self.chat_widget
                     .on_reprompt_refinement_result(original_text, result, generation);
             }
+            AppEvent::RepromptInsightsResult(result) => {
+                self.chat_widget.on_reprompt_insights_result(result);
+            }
         }
         Ok(AppRunControl::Continue)
     }
@@ -5900,6 +5905,14 @@ impl App {
         // ── /reprompt overlay key interception ──────────────────────
         if self.chat_widget.has_reprompt_overlay()
             && self.chat_widget.handle_reprompt_overlay_key(key_event)
+        {
+            tui.frame_requester().schedule_frame();
+            return;
+        }
+
+        // ── /reprompt-insights overlay key interception ─────────────
+        if self.chat_widget.has_insights_overlay()
+            && self.chat_widget.handle_insights_overlay_key(key_event)
         {
             tui.frame_requester().schedule_frame();
             return;

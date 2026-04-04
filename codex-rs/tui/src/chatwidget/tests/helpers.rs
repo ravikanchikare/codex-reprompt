@@ -294,6 +294,7 @@ pub(super) async fn make_chatwidget_manual(
         reprompt_context_buffer: crate::reprompt::ThreadContextBuffer::new(10),
         reprompt_project_context_cache: crate::reprompt::ProjectContextCache::new(),
         reprompt_resolution_context: None,
+        insights_overlay: None,
     };
     widget.set_model(&resolved_model);
     (widget, rx, op_rx)

@@ -579,6 +579,9 @@ pub(crate) enum AppEvent {
         result: crate::reprompt::RepromptResult,
         generation: u64,
     },
+
+    /// Result of an async `/reprompt-insights` analysis API call.
+    RepromptInsightsResult(crate::reprompt::insights::InsightsResult),
 }
 
 /// The exit strategy requested by the UI layer.

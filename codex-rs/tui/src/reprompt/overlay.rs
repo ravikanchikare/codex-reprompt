@@ -90,6 +90,11 @@ impl RepromptOverlay {
         self.action.take()
     }
 
+    /// Access the overlay data (for persistence and insights).
+    pub(crate) fn data(&self) -> &RepromptOverlayData {
+        &self.data
+    }
+
     /// Handle a key event and return the resulting action.
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> RepromptOverlayAction {
         if key.kind != KeyEventKind::Press {

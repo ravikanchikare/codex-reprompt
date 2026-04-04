@@ -10,14 +10,18 @@
 //!
 //! # Module structure
 //!
-//! - `profile_config` — profile configuration loading from `~/.codex/reprompt/`
+//! - `api_utils` — shared SSE parsing utilities for API calls
 //! - `config` — `RepromptResult`, `RepromptConfig`, `TaskType`, overlay state types
+//! - `insights` — `/reprompt-insights` analysis, storage, and overlay
 //! - `overlay` — `RepromptOverlay` Ratatui widget
+//! - `profile_config` — profile configuration loading from `~/.codex/reprompt/`
 //! - `project_context` — filtered project-structure context generation + caching
-//! - `relevant_context` — relevant file/tool matching + refined mention resolution
 //! - `refinement` — async `refine_input()` API call
+//! - `relevant_context` — relevant file/tool matching + refined mention resolution
 
+pub(crate) mod api_utils;
 pub(crate) mod config;
+pub(crate) mod insights;
 pub(crate) mod overlay;
 pub(crate) mod profile_config;
 pub(crate) mod project_context;

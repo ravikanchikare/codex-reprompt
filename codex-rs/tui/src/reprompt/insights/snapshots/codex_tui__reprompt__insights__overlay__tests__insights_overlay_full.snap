@@ -1,0 +1,33 @@
+---
+source: tui/src/reprompt/insights/overlay.rs
+expression: rendered
+---
+┌ REPROMPT INSIGHTS ───────────────────────────────────────┐
+│  Skill Level: Intermediate                               │
+│  Clear goals but often omits file paths and verification │
+│    steps.                                                │
+│  Top improvement: Include @file paths when you know them.│
+│                                                          │
+│  Common Gaps (across 8 refinements):                     │
+│  ● missing_path ................ 6/8 (75%)               │
+│  ● ambiguous_reference ......... 4/8 (50%)               │
+│                                                          │
+│  Patterns:                                               │
+│  ● Frequently uses pronouns instead of specific names.   │
+│  ● Rarely includes test requirements.                    │
+│                                                          │
+│  Top Suggestions:                                        │
+│  1. Always include file paths — Specify @file paths to   │
+│    help the agent find code faster.                      │
+│     e.g. fix JWT in @src/payments/auth.rs                │
+│  2. Name specific errors — Replace pronouns with the     │
+│    actual error or bug name.                             │
+│                                                          │
+│  Reprompt Performance:                                   │
+│  ✓ Intent preserved: 7/8                                 │
+│  ✗ Scope creep: 1/8                                      │
+│  Good refinement quality with minimal scope creep.       │
+│──────────────────────────────────────────────────────────│
+│  [Esc] Dismiss                                           │
+│  ↑/↓ to scroll                                           │
+└──────────────────────────────────────────────────────────┘

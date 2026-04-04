@@ -407,36 +407,7 @@ pub(crate) async fn refine_input(
         }
     };
 
-    let mut output_text = String::new();
-    for line in full_body.lines() {
-        let line = line.trim();
-        if !line.starts_with("data: ") {
-            continue;
-        }
-        let data = &line["data: ".len()..];
-        if data == "[DONE]" {
-            break;
-        }
-        if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
-            let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            match event_type {
-                "response.output_text.delta" => {
-                    if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
-                        output_text.push_str(delta);
-                    }
-                }
-                "response.completed" => {
-                    if output_text.is_empty()
-                        && let Some(resp) = event.get("response")
-                        && let Some(text) = resp.get("output_text").and_then(|t| t.as_str())
-                    {
-                        output_text = text.to_string();
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
+    let output_text = super::api_utils::extract_output_text_from_sse(&full_body);
 
     if output_text.is_empty() {
         tracing::warn!("No output text collected from reprompt refinement stream");
