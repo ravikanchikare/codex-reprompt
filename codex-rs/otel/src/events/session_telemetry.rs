@@ -3,29 +3,29 @@ use crate::ToolDecisionSource;
 use crate::events::shared::log_and_trace_event;
 use crate::events::shared::log_event;
 use crate::events::shared::trace_event;
+use crate::metrics::API_CALL_COUNT_METRIC;
+use crate::metrics::API_CALL_DURATION_METRIC;
 use crate::metrics::MetricsClient;
 use crate::metrics::MetricsConfig;
 use crate::metrics::MetricsError;
+use crate::metrics::PROFILE_USAGE_METRIC;
+use crate::metrics::RESPONSES_API_ENGINE_IAPI_TBT_DURATION_METRIC;
+use crate::metrics::RESPONSES_API_ENGINE_IAPI_TTFT_DURATION_METRIC;
+use crate::metrics::RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC;
+use crate::metrics::RESPONSES_API_ENGINE_SERVICE_TTFT_DURATION_METRIC;
+use crate::metrics::RESPONSES_API_INFERENCE_TIME_DURATION_METRIC;
+use crate::metrics::RESPONSES_API_OVERHEAD_DURATION_METRIC;
 use crate::metrics::Result as MetricsResult;
-use crate::metrics::names::API_CALL_COUNT_METRIC;
-use crate::metrics::names::API_CALL_DURATION_METRIC;
-use crate::metrics::names::PROFILE_USAGE_METRIC;
-use crate::metrics::names::RESPONSES_API_ENGINE_IAPI_TBT_DURATION_METRIC;
-use crate::metrics::names::RESPONSES_API_ENGINE_IAPI_TTFT_DURATION_METRIC;
-use crate::metrics::names::RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC;
-use crate::metrics::names::RESPONSES_API_ENGINE_SERVICE_TTFT_DURATION_METRIC;
-use crate::metrics::names::RESPONSES_API_INFERENCE_TIME_DURATION_METRIC;
-use crate::metrics::names::RESPONSES_API_OVERHEAD_DURATION_METRIC;
-use crate::metrics::names::SSE_EVENT_COUNT_METRIC;
-use crate::metrics::names::SSE_EVENT_DURATION_METRIC;
-use crate::metrics::names::TOOL_CALL_COUNT_METRIC;
-use crate::metrics::names::TOOL_CALL_DURATION_METRIC;
-use crate::metrics::names::WEBSOCKET_EVENT_COUNT_METRIC;
-use crate::metrics::names::WEBSOCKET_EVENT_DURATION_METRIC;
-use crate::metrics::names::WEBSOCKET_REQUEST_COUNT_METRIC;
-use crate::metrics::names::WEBSOCKET_REQUEST_DURATION_METRIC;
+use crate::metrics::SSE_EVENT_COUNT_METRIC;
+use crate::metrics::SSE_EVENT_DURATION_METRIC;
+use crate::metrics::SessionMetricTagValues;
+use crate::metrics::TOOL_CALL_COUNT_METRIC;
+use crate::metrics::TOOL_CALL_DURATION_METRIC;
+use crate::metrics::WEBSOCKET_EVENT_COUNT_METRIC;
+use crate::metrics::WEBSOCKET_EVENT_DURATION_METRIC;
+use crate::metrics::WEBSOCKET_REQUEST_COUNT_METRIC;
+use crate::metrics::WEBSOCKET_REQUEST_DURATION_METRIC;
 use crate::metrics::runtime_metrics::RuntimeMetricsSummary;
-use crate::metrics::tags::SessionMetricTagValues;
 use crate::metrics::timer::Timer;
 use crate::provider::OtelProvider;
 use crate::sanitize_metric_tag_value;
@@ -304,6 +304,23 @@ impl SessionTelemetry {
                 if let ResponseItem::FunctionCall { name, .. } = item {
                     handle_responses_span.record("tool_name", name.as_str());
                 }
+            }
+            ResponseEvent::Completed {
+                token_usage: Some(token_usage),
+                ..
+            } => {
+                handle_responses_span.record("gen_ai.usage.input_tokens", token_usage.input_tokens);
+                handle_responses_span.record(
+                    "gen_ai.usage.cache_read.input_tokens",
+                    token_usage.cached_input(),
+                );
+                handle_responses_span
+                    .record("gen_ai.usage.output_tokens", token_usage.output_tokens);
+                handle_responses_span.record(
+                    "codex.usage.reasoning_output_tokens",
+                    token_usage.reasoning_output_tokens,
+                );
+                handle_responses_span.record("codex.usage.total_tokens", token_usage.total_tokens);
             }
             _ => {}
         }
@@ -1051,12 +1068,14 @@ impl SessionTelemetry {
             }
             ResponseEvent::Completed { .. } => "completed".into(),
             ResponseEvent::OutputTextDelta(_) => "text_delta".into(),
+            ResponseEvent::ToolCallInputDelta { .. } => "tool_input_delta".into(),
             ResponseEvent::ReasoningSummaryDelta { .. } => "reasoning_summary_delta".into(),
             ResponseEvent::ReasoningContentDelta { .. } => "reasoning_content_delta".into(),
             ResponseEvent::ReasoningSummaryPartAdded { .. } => {
                 "reasoning_summary_part_added".into()
             }
             ResponseEvent::ServerModel(_) => "server_model".into(),
+            ResponseEvent::ModelVerifications(_) => "model_verifications".into(),
             ResponseEvent::ServerReasoningIncluded(_) => "server_reasoning_included".into(),
             ResponseEvent::RateLimits(_) => "rate_limits".into(),
             ResponseEvent::ModelsEtag(_) => "models_etag".into(),
@@ -1076,8 +1095,8 @@ impl SessionTelemetry {
             ResponseItem::CustomToolCallOutput { .. } => "custom_tool_call_output".into(),
             ResponseItem::WebSearchCall { .. } => "web_search_call".into(),
             ResponseItem::ImageGenerationCall { .. } => "image_generation_call".into(),
-            ResponseItem::GhostSnapshot { .. } => "ghost_snapshot".into(),
             ResponseItem::Compaction { .. } => "compaction".into(),
+            ResponseItem::ContextCompaction { .. } => "context_compaction".into(),
             ResponseItem::Other => "other".into(),
         }
     }

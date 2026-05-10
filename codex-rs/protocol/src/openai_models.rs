@@ -17,9 +17,11 @@ use ts_rs::TS;
 
 use crate::config_types::Personality;
 use crate::config_types::ReasoningSummary;
+use crate::config_types::ServiceTier;
 use crate::config_types::Verbosity;
 
 const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
+pub const SPEED_TIER_FAST: &str = "fast";
 
 /// See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning
 #[derive(
@@ -114,6 +116,13 @@ pub struct ModelAvailabilityNux {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
+pub struct ModelServiceTier {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
 /// Metadata describing a Codex-supported model.
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
 pub struct ModelPreset {
@@ -132,6 +141,12 @@ pub struct ModelPreset {
     /// Whether this model supports personality-specific instructions.
     #[serde(default)]
     pub supports_personality: bool,
+    /// Deprecated: use `service_tiers` instead.
+    #[serde(default)]
+    pub additional_speed_tiers: Vec<String>,
+    /// Service tiers this model can run with.
+    #[serde(default)]
+    pub service_tiers: Vec<ModelServiceTier>,
     /// Whether this is the default model for new users.
     pub is_default: bool,
     /// recommended upgrade model
@@ -188,7 +203,6 @@ pub enum ConfigShellToolType {
 #[serde(rename_all = "snake_case")]
 pub enum ApplyPatchToolType {
     Freeform,
-    Function,
 }
 
 #[derive(
@@ -252,6 +266,10 @@ pub struct ModelInfo {
     pub visibility: ModelVisibility,
     pub supported_in_api: bool,
     pub priority: i32,
+    #[serde(default)]
+    pub additional_speed_tiers: Vec<String>,
+    #[serde(default)]
+    pub service_tiers: Vec<ModelServiceTier>,
     pub availability_nux: Option<ModelAvailabilityNux>,
     pub upgrade: Option<ModelInfoUpgrade>,
     pub base_instructions: String,
@@ -271,6 +289,9 @@ pub struct ModelInfo {
     pub supports_image_detail_original: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<i64>,
+    /// Maximum context window allowed for config overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_window: Option<i64>,
     /// Token threshold for automatic compaction. When omitted, core derives it
     /// from `context_window` (90%). When provided, core clamps it to 90% of the
     /// context window when available.
@@ -294,9 +315,13 @@ pub struct ModelInfo {
 }
 
 impl ModelInfo {
+    pub fn resolved_context_window(&self) -> Option<i64> {
+        self.context_window.or(self.max_context_window)
+    }
+
     pub fn auto_compact_token_limit(&self) -> Option<i64> {
         let context_limit = self
-            .context_window
+            .resolved_context_window()
             .map(|context_window| (context_window * 9) / 10);
         let config_limit = self.auto_compact_token_limit;
         if let Some(context_limit) = context_limit {
@@ -428,6 +453,8 @@ impl From<ModelInfo> for ModelPreset {
                 .unwrap_or(ReasoningEffort::None),
             supported_reasoning_efforts: info.supported_reasoning_levels.clone(),
             supports_personality,
+            additional_speed_tiers: info.additional_speed_tiers,
+            service_tiers: info.service_tiers,
             is_default: false, // default is the highest priority available model
             upgrade: info.upgrade.as_ref().map(|upgrade| ModelUpgrade {
                 id: upgrade.model.clone(),
@@ -445,6 +472,26 @@ impl From<ModelInfo> for ModelPreset {
             supported_in_api: info.supported_in_api,
             input_modalities: info.input_modalities,
         }
+    }
+}
+
+impl ModelPreset {
+    pub fn supports_fast_mode(&self) -> bool {
+        self.service_tiers
+            .iter()
+            .any(|tier| tier.id == ServiceTier::Fast.request_value())
+            || self
+                .additional_speed_tiers
+                .iter()
+                .any(|tier| tier == SPEED_TIER_FAST)
+    }
+}
+
+impl ModelInfo {
+    pub fn supports_service_tier(&self, service_tier: &str) -> bool {
+        self.service_tiers
+            .iter()
+            .any(|tier| tier.id == service_tier)
     }
 }
 
@@ -527,6 +574,8 @@ mod tests {
             visibility: ModelVisibility::List,
             supported_in_api: true,
             priority: 1,
+            additional_speed_tiers: Vec::new(),
+            service_tiers: Vec::new(),
             availability_nux: None,
             upgrade: None,
             base_instructions: "base".to_string(),
@@ -541,6 +590,7 @@ mod tests {
             supports_parallel_tool_calls: false,
             supports_image_detail_original: false,
             context_window: None,
+            max_context_window: None,
             auto_compact_token_limit: None,
             effective_context_window_percent: 95,
             experimental_supported_tools: vec![],
@@ -767,11 +817,36 @@ mod tests {
     }
 
     #[test]
+    fn resolved_context_window_prefers_context_window() {
+        let model = ModelInfo {
+            context_window: Some(273_000),
+            max_context_window: Some(400_000),
+            ..test_model(/*spec*/ None)
+        };
+
+        assert_eq!(model.resolved_context_window(), Some(273_000));
+    }
+
+    #[test]
+    fn resolved_context_window_falls_back_to_max_context_window() {
+        let model = ModelInfo {
+            context_window: None,
+            max_context_window: Some(400_000),
+            ..test_model(/*spec*/ None)
+        };
+
+        assert_eq!(model.resolved_context_window(), Some(400_000));
+        assert_eq!(model.auto_compact_token_limit(), Some(360_000));
+    }
+
+    #[test]
     fn model_preset_preserves_availability_nux() {
         let preset = ModelPreset::from(ModelInfo {
             availability_nux: Some(ModelAvailabilityNux {
                 message: "Try Spark.".to_string(),
             }),
+            additional_speed_tiers: vec![SPEED_TIER_FAST.to_string()],
+            service_tiers: Vec::new(),
             ..test_model(/*spec*/ None)
         });
 
@@ -781,5 +856,20 @@ mod tests {
                 message: "Try Spark.".to_string(),
             })
         );
+        assert!(preset.supports_fast_mode());
+    }
+
+    #[test]
+    fn model_preset_supports_fast_mode_from_service_tiers() {
+        let preset = ModelPreset::from(ModelInfo {
+            service_tiers: vec![ModelServiceTier {
+                id: ServiceTier::Fast.request_value().to_string(),
+                name: "Fast".to_string(),
+                description: "Priority processing.".to_string(),
+            }],
+            ..test_model(/*spec*/ None)
+        });
+
+        assert!(preset.supports_fast_mode());
     }
 }

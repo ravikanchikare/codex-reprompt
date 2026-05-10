@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use codex_git_utils::GitSha;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::ReasoningSummary;
@@ -11,6 +10,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::FileChange;
+pub use codex_protocol::protocol::GitSha;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
@@ -46,6 +46,9 @@ pub struct InitializeCapabilities {
     /// Opt into receiving experimental API methods and fields.
     #[serde(default)]
     pub experimental_api: bool,
+    /// Opt into `attestation/generate` requests for upstream `x-oai-attestation`.
+    #[serde(default)]
+    pub request_attestation: bool,
     /// Exact notification method names that should be suppressed for this
     /// connection (for example `thread/started`).
     #[ts(optional = nullable)]

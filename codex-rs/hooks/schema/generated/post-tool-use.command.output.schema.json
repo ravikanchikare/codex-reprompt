@@ -11,7 +11,10 @@
     "HookEventNameWire": {
       "enum": [
         "PreToolUse",
+        "PermissionRequest",
         "PostToolUse",
+        "PreCompact",
+        "PostCompact",
         "SessionStart",
         "UserPromptSubmit",
         "Stop"

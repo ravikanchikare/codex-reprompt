@@ -48,6 +48,7 @@ fn apply_session_meta_from_item(metadata: &mut ThreadMetadata, meta_line: &Sessi
     }
     metadata.id = meta_line.meta.id;
     metadata.source = enum_to_string(&meta_line.meta.source);
+    metadata.thread_source = meta_line.meta.thread_source;
     metadata.agent_nickname = meta_line.meta.agent_nickname.clone();
     metadata.agent_role = meta_line.meta.agent_role.clone();
     metadata.agent_path = meta_line.meta.agent_path.clone();
@@ -99,9 +100,7 @@ fn apply_event_msg(metadata: &mut ThreadMetadata, event: &EventMsg) {
     }
 }
 
-fn apply_response_item(_metadata: &mut ThreadMetadata, _item: &ResponseItem) {
-    // Title and first_user_message are derived from EventMsg::UserMessage only.
-}
+fn apply_response_item(_metadata: &mut ThreadMetadata, _item: &ResponseItem) {}
 
 fn strip_user_message_prefix(text: &str) -> &str {
     match text.find(USER_MESSAGE_BEGIN) {
@@ -169,7 +168,6 @@ mod tests {
             content: vec![ContentItem::InputText {
                 text: "hello from response item".to_string(),
             }],
-            end_turn: None,
             phase: None,
         });
 
@@ -252,6 +250,7 @@ mod tests {
                     originator: "codex_cli_rs".to_string(),
                     cli_version: "0.0.0".to_string(),
                     source: SessionSource::Cli,
+                    thread_source: None,
                     agent_path: None,
                     agent_nickname: None,
                     agent_role: None,
@@ -274,7 +273,9 @@ mod tests {
                 timezone: None,
                 approval_policy: AskForApproval::Never,
                 sandbox_policy: SandboxPolicy::DangerFullAccess,
+                permission_profile: None,
                 network: None,
+                file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
                 personality: None,
                 collaboration_mode: None,
@@ -312,7 +313,9 @@ mod tests {
                 timezone: None,
                 approval_policy: AskForApproval::OnRequest,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                permission_profile: None,
                 network: None,
+                file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
                 personality: None,
                 collaboration_mode: None,
@@ -344,7 +347,9 @@ mod tests {
                 timezone: None,
                 approval_policy: AskForApproval::OnRequest,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                permission_profile: None,
                 network: None,
+                file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
                 personality: None,
                 collaboration_mode: None,
@@ -379,6 +384,7 @@ mod tests {
                     originator: "codex_cli_rs".to_string(),
                     cli_version: "0.0.0".to_string(),
                     source: SessionSource::Cli,
+                    thread_source: None,
                     agent_path: None,
                     agent_nickname: None,
                     agent_role: None,
@@ -405,6 +411,7 @@ mod tests {
             created_at,
             updated_at: created_at,
             source: "cli".to_string(),
+            thread_source: None,
             agent_path: None,
             agent_nickname: None,
             agent_role: None,

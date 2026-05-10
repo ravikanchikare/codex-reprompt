@@ -1,8 +1,8 @@
-use crate::codex::TurnContext;
 use crate::context_manager::normalize;
 use crate::event_mapping::has_non_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_user_message_content;
+use crate::session::turn_context::TurnContext;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_protocol::models::BaseInstructions;
@@ -34,6 +34,8 @@ use std::sync::LazyLock;
 pub(crate) struct ContextManager {
     /// The oldest items are at the beginning of the vector.
     items: Vec<ResponseItem>,
+    /// Bumped whenever history is rewritten, such as compaction or rollback.
+    history_version: u64,
     token_info: Option<TokenUsageInfo>,
     /// Reference context snapshot used for diffing and producing model-visible
     /// settings update items.
@@ -60,6 +62,7 @@ impl ContextManager {
     pub(crate) fn new() -> Self {
         Self {
             items: Vec::new(),
+            history_version: 0,
             token_info: TokenUsageInfo::new_or_append(
                 &None, &None, /*model_context_window*/ None,
             ),
@@ -100,8 +103,7 @@ impl ContextManager {
     {
         for item in items {
             let item_ref = item.deref();
-            let is_ghost_snapshot = matches!(item_ref, ResponseItem::GhostSnapshot { .. });
-            if !is_api_message(item_ref) && !is_ghost_snapshot {
+            if !is_api_message(item_ref) {
                 continue;
             }
 
@@ -117,13 +119,15 @@ impl ContextManager {
     pub(crate) fn for_prompt(mut self, input_modalities: &[InputModality]) -> Vec<ResponseItem> {
         self.normalize_history(input_modalities);
         self.items
-            .retain(|item| !matches!(item, ResponseItem::GhostSnapshot { .. }));
-        self.items
     }
 
     /// Returns raw items in the history.
     pub(crate) fn raw_items(&self) -> &[ResponseItem] {
         &self.items
+    }
+
+    pub(crate) fn history_version(&self) -> u64 {
+        self.history_version
     }
 
     // Estimate token usage using byte-based heuristics from the truncation helpers.
@@ -168,6 +172,7 @@ impl ContextManager {
     pub(crate) fn remove_last_item(&mut self) -> bool {
         if let Some(removed) = self.items.pop() {
             normalize::remove_corresponding_for(&mut self.items, &removed);
+            self.history_version = self.history_version.saturating_add(1);
             true
         } else {
             false
@@ -176,6 +181,7 @@ impl ContextManager {
 
     pub(crate) fn replace(&mut self, items: Vec<ResponseItem>) {
         self.items = items;
+        self.history_version = self.history_version.saturating_add(1);
     }
 
     /// Replace image content in the last turn if it originated from a tool output.
@@ -201,6 +207,9 @@ impl ContextManager {
                         };
                         replaced = true;
                     }
+                }
+                if replaced {
+                    self.history_version = self.history_version.saturating_add(1);
                 }
                 replaced
             }
@@ -391,7 +400,7 @@ impl ContextManager {
             | ResponseItem::ImageGenerationCall { .. }
             | ResponseItem::CustomToolCall { .. }
             | ResponseItem::Compaction { .. }
-            | ResponseItem::GhostSnapshot { .. }
+            | ResponseItem::ContextCompaction { .. }
             | ResponseItem::Other => item.clone(),
         }
     }
@@ -444,7 +453,7 @@ impl ContextManager {
     }
 }
 
-fn truncate_function_output_payload(
+pub(crate) fn truncate_function_output_payload(
     output: &FunctionCallOutputPayload,
     policy: TruncationPolicy,
 ) -> FunctionCallOutputPayload {
@@ -479,8 +488,8 @@ fn is_api_message(message: &ResponseItem) -> bool {
         | ResponseItem::Reasoning { .. }
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::ImageGenerationCall { .. }
-        | ResponseItem::Compaction { .. } => true,
-        ResponseItem::GhostSnapshot { .. } => false,
+        | ResponseItem::Compaction { .. }
+        | ResponseItem::ContextCompaction { .. } => true,
         ResponseItem::Other => false,
     }
 }
@@ -507,6 +516,10 @@ const RESIZED_IMAGE_BYTES_ESTIMATE: i64 = 7373;
 // Use a direct 32px patch count only for `detail: "original"`;
 // all other image inputs continue to use `RESIZED_IMAGE_BYTES_ESTIMATE`.
 const ORIGINAL_IMAGE_PATCH_SIZE: u32 = 32;
+// See https://platform.openai.com/docs/guides/images-vision#model-sizing-behavior.
+// Keep this hard-coded for now; move it into model capabilities if the patch
+// budget starts changing often across model releases.
+const ORIGINAL_IMAGE_MAX_PATCHES: usize = 10_000;
 const ORIGINAL_IMAGE_ESTIMATE_CACHE_SIZE: usize = 32;
 
 static ORIGINAL_IMAGE_ESTIMATE_CACHE: LazyLock<BlockingLruCache<[u8; 20], Option<i64>>> =
@@ -518,13 +531,15 @@ static ORIGINAL_IMAGE_ESTIMATE_CACHE: LazyLock<BlockingLruCache<[u8; 20], Option
 
 pub(crate) fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
     match item {
-        ResponseItem::GhostSnapshot { .. } => 0,
         ResponseItem::Reasoning {
             encrypted_content: Some(content),
             ..
         }
         | ResponseItem::Compaction {
             encrypted_content: content,
+        }
+        | ResponseItem::ContextCompaction {
+            encrypted_content: Some(content),
         } => i64::try_from(estimate_reasoning_length(content.len())).unwrap_or(i64::MAX),
         item => {
             let raw = serde_json::to_string(item)
@@ -609,6 +624,7 @@ fn estimate_original_image_bytes(image_url: &str) -> Option<i64> {
         let patches_high = height.saturating_add(patch_size.saturating_sub(1)) / patch_size;
         let patch_count = patches_wide.saturating_mul(patches_high);
         let patch_count = usize::try_from(patch_count).unwrap_or(usize::MAX);
+        let patch_count = patch_count.min(ORIGINAL_IMAGE_MAX_PATCHES);
         Some(i64::try_from(approx_bytes_for_tokens(patch_count)).unwrap_or(i64::MAX))
     })
 }
@@ -637,8 +653,8 @@ fn image_data_url_estimate_adjustment(item: &ResponseItem) -> (i64, i64) {
     match item {
         ResponseItem::Message { content, .. } => {
             for content_item in content {
-                if let ContentItem::InputImage { image_url } = content_item {
-                    accumulate(image_url, None);
+                if let ContentItem::InputImage { image_url, detail } = content_item {
+                    accumulate(image_url, *detail);
                 }
             }
         }
@@ -670,11 +686,11 @@ fn is_model_generated_item(item: &ResponseItem) -> bool {
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::CustomToolCall { .. }
         | ResponseItem::LocalShellCall { .. }
-        | ResponseItem::Compaction { .. } => true,
+        | ResponseItem::Compaction { .. }
+        | ResponseItem::ContextCompaction { .. } => true,
         ResponseItem::FunctionCallOutput { .. }
         | ResponseItem::ToolSearchOutput { .. }
         | ResponseItem::CustomToolCallOutput { .. }
-        | ResponseItem::GhostSnapshot { .. }
         | ResponseItem::Other => false,
     }
 }

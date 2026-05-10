@@ -140,7 +140,7 @@ trust_level = "trusted"
     let mut startup_ready = false;
     let mut answered_cursor_query = false;
 
-    let exit_code_result = timeout(Duration::from_secs(15), async {
+    let exit_code_result = timeout(Duration::from_secs(30), async {
         loop {
             select! {
                 result = output_rx.recv() => match result {
@@ -177,15 +177,24 @@ trust_level = "trusted"
         }
     };
     let output_text = String::from_utf8_lossy(&output);
-    let interrupt_only_output = {
-        let trimmed_output = output_text.trim();
-        !trimmed_output.is_empty()
-            && trimmed_output
+    let rendered_output = {
+        let mut parser = vt100::Parser::new(
+            /*rows*/ 24, /*cols*/ 80, /*scrollback_len*/ 0,
+        );
+        parser.process(&output);
+        parser.screen().contents()
+    };
+    let interrupted_during_terminal_startup = {
+        let trimmed_output = rendered_output.trim();
+        trimmed_output.is_empty()
+            || trimmed_output
                 .chars()
                 .all(|character| character == '^' || character == 'C' || character.is_whitespace())
     };
     anyhow::ensure!(
-        exit_code == 0 || exit_code == 130 || (exit_code == 1 && interrupt_only_output),
+        exit_code == 0
+            || exit_code == 130
+            || (exit_code == 1 && interrupted_during_terminal_startup),
         "unexpected exit code from codex resume: {exit_code}; output: {output_text}",
     );
 

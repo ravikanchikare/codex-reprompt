@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::codex::TurnContext;
-use crate::codex::run_turn;
+use crate::session::turn::run_turn;
+use crate::session::turn_context::TurnContext;
 use crate::session_startup_prewarm::SessionStartupPrewarmResolution;
 use crate::state::TaskKind;
 use codex_protocol::protocol::EventMsg;
@@ -33,6 +33,10 @@ impl SessionTask for RegularTask {
         "session_task.turn"
     }
 
+    fn records_turn_token_usage_on_span(&self) -> bool {
+        true
+    }
+
     async fn run(
         self: Arc<Self>,
         session: Arc<SessionTaskContext>,
@@ -46,6 +50,7 @@ impl SessionTask for RegularTask {
         // not wait on startup prewarm resolution.
         let event = EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: ctx.sub_id.clone(),
+            started_at: ctx.turn_timing_state.started_at_unix_secs().await,
             model_context_window: ctx.model_context_window(),
             collaboration_mode_kind: ctx.collaboration_mode.mode,
         });

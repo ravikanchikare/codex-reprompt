@@ -7,8 +7,6 @@ use codex_config::McpServerTransportConfig;
 use codex_config::load_global_mcp_servers;
 use codex_login::default_client::is_first_party_originator;
 use codex_login::default_client::originator;
-use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputQuestion;
 use codex_protocol::request_user_input::RequestUserInputQuestionOption;
@@ -18,13 +16,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::SkillMetadata;
-use crate::codex::Session;
-use crate::codex::TurnContext;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::skills::model::SkillToolDependency;
-use codex_mcp::mcp::auth::McpOAuthLoginSupport;
-use codex_mcp::mcp::auth::oauth_login_support;
-use codex_mcp::mcp::auth::resolve_oauth_scopes;
-use codex_mcp::mcp::auth::should_retry_without_scopes;
+use codex_mcp::ElicitationReviewerHandle;
+use codex_mcp::McpOAuthLoginSupport;
+use codex_mcp::McpPermissionPromptAutoApproveContext;
+use codex_mcp::mcp_permission_prompt_is_auto_approved;
+use codex_mcp::oauth_login_support;
+use codex_mcp::resolve_oauth_scopes;
+use codex_mcp::should_retry_without_scopes;
 
 const SKILL_MCP_DEPENDENCY_PROMPT_ID: &str = "skill_mcp_dependency_install";
 const MCP_DEPENDENCY_OPTION_INSTALL: &str = "Install";
@@ -35,6 +36,7 @@ pub(crate) async fn maybe_prompt_and_install_mcp_dependencies(
     turn_context: &TurnContext,
     cancellation_token: &CancellationToken,
     mentioned_skills: &[SkillMetadata],
+    elicitation_reviewer: Option<ElicitationReviewerHandle>,
 ) {
     let originator_value = originator().value;
     if !is_first_party_originator(originator_value.as_str()) {
@@ -54,7 +56,8 @@ pub(crate) async fn maybe_prompt_and_install_mcp_dependencies(
     let installed = sess
         .services
         .mcp_manager
-        .configured_servers(config.as_ref());
+        .configured_servers(config.as_ref())
+        .await;
     let missing = collect_missing_mcp_dependencies(mentioned_skills, &installed);
     if missing.is_empty() {
         return;
@@ -68,7 +71,14 @@ pub(crate) async fn maybe_prompt_and_install_mcp_dependencies(
     if should_install_mcp_dependencies(sess, turn_context, &unprompted_missing, cancellation_token)
         .await
     {
-        maybe_install_mcp_dependencies(sess, turn_context, config.as_ref(), mentioned_skills).await;
+        maybe_install_mcp_dependencies(
+            sess,
+            turn_context,
+            config.as_ref(),
+            mentioned_skills,
+            elicitation_reviewer,
+        )
+        .await;
     }
 }
 
@@ -77,6 +87,7 @@ pub(crate) async fn maybe_install_mcp_dependencies(
     turn_context: &TurnContext,
     config: &crate::config::Config,
     mentioned_skills: &[SkillMetadata],
+    elicitation_reviewer: Option<ElicitationReviewerHandle>,
 ) {
     if mentioned_skills.is_empty()
         || !config
@@ -87,7 +98,7 @@ pub(crate) async fn maybe_install_mcp_dependencies(
     }
 
     let codex_home = config.codex_home.clone();
-    let installed = sess.services.mcp_manager.configured_servers(config);
+    let installed = sess.services.mcp_manager.configured_servers(config).await;
     let missing = collect_missing_mcp_dependencies(mentioned_skills, &installed);
     if missing.is_empty() {
         return;
@@ -135,14 +146,6 @@ pub(crate) async fn maybe_install_mcp_dependencies(
             }
         };
 
-        sess.notify_background_event(
-            turn_context,
-            format!(
-                "Authenticating MCP {name}... Follow instructions in your browser if prompted."
-            ),
-        )
-        .await;
-
         let resolved_scopes = resolve_oauth_scopes(
             /*explicit_scopes*/ None,
             server_config.scopes.clone(),
@@ -163,14 +166,6 @@ pub(crate) async fn maybe_install_mcp_dependencies(
 
         if let Err(err) = first_attempt {
             if should_retry_without_scopes(&resolved_scopes, &err) {
-                sess.notify_background_event(
-                    turn_context,
-                    format!(
-                        "Retrying MCP {name} authentication without scopes after provider rejection."
-                    ),
-                )
-                .await;
-
                 if let Err(err) = perform_oauth_login(
                     &name,
                     &oauth_config.url,
@@ -192,13 +187,11 @@ pub(crate) async fn maybe_install_mcp_dependencies(
         }
     }
 
-    // Refresh from the effective merged MCP map (global + repo + managed) and
-    // overlay the updated global servers so we don't drop repo-scoped servers.
-    let auth = sess.services.auth_manager.auth().await;
-    let mut refresh_servers = sess
-        .services
-        .mcp_manager
-        .effective_servers(config, auth.as_ref());
+    // Refresh from the config-backed merged MCP map (global + repo + managed)
+    // and overlay the updated global servers so we don't drop repo-scoped
+    // servers. Runtime additions such as built-ins are rebuilt by the refresh
+    // path from the current config.
+    let mut refresh_servers = sess.services.mcp_manager.configured_servers(config).await;
     for (name, server_config) in &servers {
         refresh_servers
             .entry(name.clone())
@@ -208,6 +201,7 @@ pub(crate) async fn maybe_install_mcp_dependencies(
         turn_context,
         refresh_servers,
         config.mcp_oauth_credentials_store_mode,
+        elicitation_reviewer,
     )
     .await;
 }
@@ -218,7 +212,11 @@ async fn should_install_mcp_dependencies(
     missing: &HashMap<String, McpServerConfig>,
     cancellation_token: &CancellationToken,
 ) -> bool {
-    if is_full_access_mode(turn_context) {
+    if mcp_permission_prompt_is_auto_approved(
+        turn_context.approval_policy.value(),
+        &turn_context.permission_profile(),
+        McpPermissionPromptAutoApproveContext::default(),
+    ) {
         return true;
     }
 
@@ -305,14 +303,6 @@ fn format_missing_mcp_dependencies(missing: &HashMap<String, McpServerConfig>) -
     names.join(", ")
 }
 
-fn is_full_access_mode(turn_context: &TurnContext) -> bool {
-    matches!(turn_context.approval_policy.value(), AskForApproval::Never)
-        && matches!(
-            turn_context.sandbox_policy.get(),
-            SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. }
-        )
-}
-
 fn canonical_mcp_key(transport: &str, identifier: &str, fallback: &str) -> String {
     let identifier = identifier.trim();
     if identifier.is_empty() {
@@ -368,11 +358,14 @@ fn mcp_dependency_to_server_config(
                 http_headers: None,
                 env_http_headers: None,
             },
+            experimental_environment: None,
             enabled: true,
             required: false,
+            supports_parallel_tool_calls: false,
             disabled_reason: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,
+            default_tools_approval_mode: None,
             enabled_tools: None,
             disabled_tools: None,
             scopes: None,
@@ -394,11 +387,14 @@ fn mcp_dependency_to_server_config(
                 env_vars: Vec::new(),
                 cwd: None,
             },
+            experimental_environment: None,
             enabled: true,
             required: false,
+            supports_parallel_tool_calls: false,
             disabled_reason: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,
+            default_tools_approval_mode: None,
             enabled_tools: None,
             disabled_tools: None,
             scopes: None,

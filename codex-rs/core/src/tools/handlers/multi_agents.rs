@@ -7,9 +7,9 @@
 
 use crate::agent::AgentStatus;
 use crate::agent::exceeds_thread_spawn_depth_limit;
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -32,6 +32,7 @@ use codex_protocol::protocol::CollabResumeEndEvent;
 use codex_protocol::protocol::CollabWaitingBeginEvent;
 use codex_protocol::protocol::CollabWaitingEndEvent;
 use codex_protocol::user_input::UserInput;
+use codex_tools::ToolName;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -63,7 +64,7 @@ pub(crate) use send_input::Handler as SendInputHandler;
 pub(crate) use spawn::Handler as SpawnAgentHandler;
 pub(crate) use wait::Handler as WaitAgentHandler;
 
-pub mod close_agent;
+pub(crate) mod close_agent;
 mod resume_agent;
 mod send_input;
 mod spawn;

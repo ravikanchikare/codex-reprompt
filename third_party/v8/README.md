@@ -3,18 +3,37 @@
 This directory wires the `v8` crate to exact-version Bazel inputs.
 Bazel consumer builds use:
 
-- upstream `denoland/rusty_v8` release archives on Windows
-- source-built V8 archives on Darwin, GNU Linux, and musl Linux
+- upstream `denoland/rusty_v8` release archives on Windows MSVC
+- source-built V8 archives on Darwin, GNU Linux, musl Linux, and Windows GNU
 - `openai/codex` release assets for published musl release pairs
 
 Cargo builds still use prebuilt `rusty_v8` archives by default. Only Bazel
 overrides `RUSTY_V8_ARCHIVE`/`RUSTY_V8_SRC_BINDING_PATH` in `MODULE.bazel` to
 select source-built local archives for its consumer builds.
 
+Source-built Bazel V8 artifacts enable V8's in-process sandbox by default, and
+the Bazel `v8` crate feature selection tracks those targets. A full consumer
+rollout still needs matching sandbox-enabled archives for every non-source-built
+target. Until that artifact migration lands, the rusty_v8 publishing workflows
+use `--config=v8-release-compat` to preserve the current non-sandboxed release
+artifact contract.
+
 Current pinned versions:
 
 - Rust crate: `v8 = =146.4.0`
 - Embedded upstream V8 source for musl release builds: `14.6.202.9`
+
+When bumping the Rust crate version, keep the checked-in checksum manifest and
+`MODULE.bazel` in sync:
+
+```bash
+python3 .github/scripts/rusty_v8_bazel.py update-module-bazel
+python3 .github/scripts/rusty_v8_bazel.py check-module-bazel
+```
+
+The commands read `third_party/v8/rusty_v8_<crate_version>.sha256` by default
+and validate every matching `rusty_v8_<crate_version>` `http_file` entry.
+CI runs the check command to block checksum drift.
 
 The consumer-facing selectors are:
 

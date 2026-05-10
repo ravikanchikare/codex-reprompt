@@ -7,13 +7,15 @@
 mod cli;
 mod event_processor;
 mod event_processor_with_human_output;
-pub mod event_processor_with_jsonl_output;
-pub mod exec_events;
+pub(crate) mod event_processor_with_jsonl_output;
+pub(crate) mod exec_events;
 
 pub use cli::Cli;
 pub use cli::Command;
 pub use cli::ReviewArgs;
 use codex_app_server_client::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
+use codex_app_server_client::EnvironmentManager;
+use codex_app_server_client::ExecServerRuntimePaths;
 use codex_app_server_client::InProcessAppServerClient;
 use codex_app_server_client::InProcessClientStartArgs;
 use codex_app_server_client::InProcessServerEvent;
@@ -22,6 +24,8 @@ use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::McpServerElicitationAction;
 use codex_app_server_protocol::McpServerElicitationRequestResponse;
+use codex_app_server_protocol::PermissionProfileModificationParams;
+use codex_app_server_protocol::PermissionProfileSelectionParams;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ReviewStartParams;
 use codex_app_server_protocol::ReviewStartResponse;
@@ -49,16 +53,18 @@ use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStartedNotification;
 use codex_arg0::Arg0DispatchPaths;
 use codex_cloud_requirements::cloud_requirements_loader_for_storage;
+use codex_config::ConfigLoadError;
+use codex_config::LoaderOverrides;
+use codex_config::format_config_error_with_source;
+use codex_core::StateDbHandle;
 use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::find_codex_home;
-use codex_core::config::load_config_as_toml_with_cli_overrides;
+use codex_core::config::load_config_as_toml_with_cli_and_loader_overrides;
 use codex_core::config::resolve_oss_provider;
-use codex_core::config_loader::ConfigLoadError;
-use codex_core::config_loader::LoaderOverrides;
-use codex_core::config_loader::format_config_error_with_source;
+use codex_core::find_thread_meta_by_name_str;
 use codex_core::format_exec_policy_error_with_source;
 use codex_core::path_utils;
 use codex_feedback::CodexFeedback;
@@ -71,21 +77,62 @@ use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
 use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use codex_otel::set_parent_from_context;
 use codex_otel::traceparent_context_from_env;
+use codex_protocol::SessionId;
+use codex_protocol::ThreadId;
 use codex_protocol::config_types::SandboxMode;
+use codex_protocol::models::ActivePermissionProfile;
+use codex_protocol::models::ActivePermissionProfileModification;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_absolute_path::canonicalize_existing_preserving_symlinks;
+use codex_utils_cli::SharedCliOptions;
 use codex_utils_oss::ensure_oss_provider_ready;
 use codex_utils_oss::get_default_model_for_oss_provider;
 use event_processor_with_human_output::EventProcessorWithHumanOutput;
-use event_processor_with_jsonl_output::EventProcessorWithJsonOutput;
+pub use event_processor_with_jsonl_output::CodexStatus;
+pub use event_processor_with_jsonl_output::CollectedThreadEvents;
+pub use event_processor_with_jsonl_output::EventProcessorWithJsonOutput;
+pub use exec_events::AgentMessageItem;
+pub use exec_events::CollabAgentState;
+pub use exec_events::CollabAgentStatus;
+pub use exec_events::CollabTool;
+pub use exec_events::CollabToolCallItem;
+pub use exec_events::CollabToolCallStatus;
+pub use exec_events::CommandExecutionItem;
+pub use exec_events::CommandExecutionStatus;
+pub use exec_events::ErrorItem;
+pub use exec_events::FileChangeItem;
+pub use exec_events::FileUpdateChange;
+pub use exec_events::ItemCompletedEvent;
+pub use exec_events::ItemStartedEvent;
+pub use exec_events::ItemUpdatedEvent;
+pub use exec_events::McpToolCallItem;
+pub use exec_events::McpToolCallItemError;
+pub use exec_events::McpToolCallItemResult;
+pub use exec_events::McpToolCallStatus;
+pub use exec_events::PatchApplyStatus;
+pub use exec_events::PatchChangeKind;
+pub use exec_events::ReasoningItem;
+pub use exec_events::ThreadErrorEvent;
+pub use exec_events::ThreadEvent;
+pub use exec_events::ThreadItem as ExecThreadItem;
+pub use exec_events::ThreadItemDetails;
+pub use exec_events::ThreadStartedEvent;
+pub use exec_events::TodoItem;
+pub use exec_events::TodoListItem;
+pub use exec_events::TurnCompletedEvent;
+pub use exec_events::TurnFailedEvent;
+pub use exec_events::TurnStartedEvent;
+pub use exec_events::Usage;
+pub use exec_events::WebSearchItem;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -105,10 +152,10 @@ use tracing_subscriber::prelude::*;
 use uuid::Uuid;
 
 use crate::cli::Command as ExecCommand;
-use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
 
 const DEFAULT_ANALYTICS_ENABLED: bool = true;
+const EXEC_DEFAULT_LOG_FILTER: &str = "error,opentelemetry_sdk=off,opentelemetry_otlp=off";
 
 enum InitialOperation {
     UserTurn {
@@ -150,6 +197,7 @@ impl RequestIdSequencer {
 
 struct ExecRunArgs {
     in_process_start_args: InProcessClientStartArgs,
+    state_db: Option<StateDbHandle>,
     command: Option<ExecCommand>,
     config: Config,
     dangerously_bypass_approvals_and_sandbox: bool,
@@ -174,32 +222,51 @@ fn exec_root_span() -> tracing::Span {
     )
 }
 
+fn exec_stderr_env_filter() -> EnvFilter {
+    // OTEL export is best-effort; keep exporter self-diagnostics out of
+    // headless command output unless the caller opts in with RUST_LOG.
+    EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new(EXEC_DEFAULT_LOG_FILTER))
+        .unwrap_or_else(|_| EnvFilter::new("error"))
+}
+
 pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
+    #[allow(clippy::print_stderr)]
+    if let Some(message) = cli.removed_full_auto_warning() {
+        eprintln!("{message}");
+    }
+
     if let Err(err) = set_default_originator("codex_exec".to_string()) {
         tracing::warn!(?err, "Failed to set codex exec originator override {err:?}");
     }
 
     let Cli {
         command,
+        shared,
+        skip_git_repo_check,
+        ephemeral,
+        ignore_user_config,
+        ignore_rules,
+        removed_full_auto,
+        color,
+        last_message_file,
+        json: json_mode,
+        prompt,
+        output_schema: output_schema_path,
+        config_overrides,
+    } = cli;
+    let shared = shared.into_inner();
+    let SharedCliOptions {
         images,
         model: model_cli_arg,
         oss,
         oss_provider,
         config_profile,
-        full_auto,
+        sandbox_mode: sandbox_mode_cli_arg,
         dangerously_bypass_approvals_and_sandbox,
         cwd,
-        skip_git_repo_check,
         add_dir,
-        ephemeral,
-        color,
-        last_message_file,
-        json: json_mode,
-        sandbox_mode: sandbox_mode_cli_arg,
-        prompt,
-        output_schema: output_schema_path,
-        config_overrides,
-    } = cli;
+    } = shared;
 
     let (_stdout_with_ansi, stderr_with_ansi) = match color {
         cli::Color::Always => (true, true),
@@ -209,20 +276,12 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             supports_color::on_cached(Stream::Stderr).is_some(),
         ),
     };
-    // Build fmt layer (existing logging) to compose with OTEL layer.
-    let default_level = "error";
-
-    // Build env_filter separately and attach via with_filter.
-    let env_filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new(default_level))
-        .unwrap_or_else(|_| EnvFilter::new(default_level));
-
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_ansi(stderr_with_ansi)
         .with_writer(std::io::stderr)
-        .with_filter(env_filter);
+        .with_filter(exec_stderr_env_filter());
 
-    let sandbox_mode = if full_auto {
+    let sandbox_mode = if removed_full_auto {
         Some(SandboxMode::WorkspaceWrite)
     } else if dangerously_bypass_approvals_and_sandbox {
         Some(SandboxMode::DangerFullAccess)
@@ -242,7 +301,9 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
 
     let resolved_cwd = cwd.clone();
     let config_cwd = match resolved_cwd.as_deref() {
-        Some(path) => AbsolutePathBuf::from_absolute_path(path.canonicalize()?)?,
+        Some(path) => {
+            AbsolutePathBuf::from_absolute_path(canonicalize_existing_preserving_symlinks(path)?)?
+        }
         None => AbsolutePathBuf::current_dir()?,
     };
 
@@ -257,10 +318,17 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     };
 
     #[allow(clippy::print_stderr)]
-    let config_toml = match load_config_as_toml_with_cli_overrides(
+    let loader_overrides = LoaderOverrides {
+        ignore_user_config,
+        ignore_user_and_project_exec_policy_rules: ignore_rules,
+        ..Default::default()
+    };
+
+    let config_toml = match load_config_as_toml_with_cli_and_loader_overrides(
         &codex_home,
-        &config_cwd,
+        Some(&config_cwd),
         cli_kv_overrides.clone(),
+        loader_overrides.clone(),
     )
     .await
     {
@@ -288,13 +356,14 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string());
     // TODO(gt): Make cloud requirements failures blocking once we can fail-closed.
     let cloud_requirements = cloud_requirements_loader_for_storage(
-        codex_home.clone(),
+        codex_home.to_path_buf(),
         /*enable_codex_api_key_env*/ false,
         config_toml.cli_auth_credentials_store.unwrap_or_default(),
         chatgpt_base_url,
-    );
+    )
+    .await;
     let run_cli_overrides = cli_kv_overrides.clone();
-    let run_loader_overrides = LoaderOverrides::default();
+    let run_loader_overrides = loader_overrides.clone();
     let run_cloud_requirements = cloud_requirements.clone();
 
     let model_provider = if oss {
@@ -336,14 +405,14 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         approval_policy: Some(AskForApproval::Never),
         approvals_reviewer: None,
         sandbox_mode,
+        permission_profile: None,
+        default_permissions: None,
         cwd: resolved_cwd,
         model_provider: model_provider.clone(),
         service_tier: None,
         codex_self_exe: arg0_paths.codex_self_exe.clone(),
         codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe.clone(),
         main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
-        js_repl_node_path: None,
-        js_repl_node_module_dirs: None,
         zsh_path: None,
         base_instructions: None,
         developer_instructions: None,
@@ -359,6 +428,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     let config = ConfigBuilder::default()
         .cli_overrides(cli_kv_overrides)
         .harness_overrides(overrides)
+        .loader_overrides(loader_overrides)
         .cloud_requirements(cloud_requirements)
         .build()
         .await?;
@@ -378,11 +448,14 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     set_default_client_residency_requirement(config.enforce_residency.value());
 
     if let Err(err) = enforce_login_restrictions(&AuthConfig {
-        codex_home: config.codex_home.clone(),
+        codex_home: config.codex_home.to_path_buf(),
         auth_credentials_store_mode: config.cli_auth_credentials_store_mode,
         forced_login_method: config.forced_login_method,
         forced_chatgpt_workspace_id: config.forced_chatgpt_workspace_id.clone(),
-    }) {
+        chatgpt_base_url: Some(config.chatgpt_base_url.clone()),
+    })
+    .await
+    {
         eprintln!("{err}");
         std::process::exit(1);
     }
@@ -430,6 +503,16 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             range: None,
         })
         .collect();
+    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
+        arg0_paths.codex_self_exe.clone(),
+        arg0_paths.codex_linux_sandbox_exe.clone(),
+    )?;
+    let state_db = codex_core::init_state_db(&config).await;
+    let environment_manager = if run_loader_overrides.ignore_user_config {
+        EnvironmentManager::from_env(local_runtime_paths).await?
+    } else {
+        EnvironmentManager::from_codex_home(config.codex_home.clone(), local_runtime_paths).await?
+    };
     let in_process_start_args = InProcessClientStartArgs {
         arg0_paths,
         config: std::sync::Arc::new(config.clone()),
@@ -437,6 +520,9 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         loader_overrides: run_loader_overrides,
         cloud_requirements: run_cloud_requirements,
         feedback: CodexFeedback::new(),
+        log_db: None,
+        state_db: state_db.clone(),
+        environment_manager: std::sync::Arc::new(environment_manager),
         config_warnings,
         session_source: SessionSource::Exec,
         enable_codex_api_key_env: true,
@@ -448,6 +534,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     };
     run_exec_session(ExecRunArgs {
         in_process_start_args,
+        state_db,
         command,
         config,
         dangerously_bypass_approvals_and_sandbox,
@@ -469,6 +556,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
 async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     let ExecRunArgs {
         in_process_start_args,
+        state_db,
         command,
         config,
         dangerously_bypass_approvals_and_sandbox,
@@ -511,82 +599,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
 
     let default_cwd = config.cwd.to_path_buf();
     let default_approval_policy = config.permissions.approval_policy.value();
-    let default_sandbox_policy = config.permissions.sandbox_policy.get();
     let default_effort = config.model_reasoning_effort;
-
-    // When --yolo (dangerously_bypass_approvals_and_sandbox) is set, also skip the git repo check
-    // since the user is explicitly running in an externally sandboxed environment.
-    if !skip_git_repo_check
-        && !dangerously_bypass_approvals_and_sandbox
-        && get_git_repo_root(&default_cwd).is_none()
-    {
-        eprintln!("Not inside a trusted directory and --skip-git-repo-check was not specified.");
-        std::process::exit(1);
-    }
-
-    let mut request_ids = RequestIdSequencer::new();
-    let mut client = InProcessAppServerClient::start(in_process_start_args)
-        .await
-        .map_err(|err| {
-            anyhow::anyhow!("failed to initialize in-process app-server client: {err}")
-        })?;
-
-    // Handle resume subcommand through existing `thread/list` + `thread/resume`
-    // APIs so exec no longer reaches into rollout storage directly.
-    let (primary_thread_id, fallback_session_configured) =
-        if let Some(ExecCommand::Resume(args)) = command.as_ref() {
-            if let Some(thread_id) = resolve_resume_thread_id(&client, &config, args).await? {
-                let response: ThreadResumeResponse = send_request_with_response(
-                    &client,
-                    ClientRequest::ThreadResume {
-                        request_id: request_ids.next(),
-                        params: thread_resume_params_from_config(&config, thread_id),
-                    },
-                    "thread/resume",
-                )
-                .await
-                .map_err(anyhow::Error::msg)?;
-                let session_configured = session_configured_from_thread_resume_response(&response)
-                    .map_err(anyhow::Error::msg)?;
-                (session_configured.session_id, session_configured)
-            } else {
-                let response: ThreadStartResponse = send_request_with_response(
-                    &client,
-                    ClientRequest::ThreadStart {
-                        request_id: request_ids.next(),
-                        params: thread_start_params_from_config(&config),
-                    },
-                    "thread/start",
-                )
-                .await
-                .map_err(anyhow::Error::msg)?;
-                let session_configured = session_configured_from_thread_start_response(&response)
-                    .map_err(anyhow::Error::msg)?;
-                (session_configured.session_id, session_configured)
-            }
-        } else {
-            let response: ThreadStartResponse = send_request_with_response(
-                &client,
-                ClientRequest::ThreadStart {
-                    request_id: request_ids.next(),
-                    params: thread_start_params_from_config(&config),
-                },
-                "thread/start",
-            )
-            .await
-            .map_err(anyhow::Error::msg)?;
-            let session_configured = session_configured_from_thread_start_response(&response)
-                .map_err(anyhow::Error::msg)?;
-            (session_configured.session_id, session_configured)
-        };
-
-    let primary_thread_id_for_span = primary_thread_id.to_string();
-    // Use the start/resume response as the authoritative bootstrap payload.
-    // Waiting for a later streamed `SessionConfigured` event adds up to 10s of
-    // avoidable startup latency on the in-process path.
-    let session_configured = fallback_session_configured;
-
-    exec_span.record("thread.id", primary_thread_id_for_span.as_str());
 
     let (initial_operation, prompt_summary) = match (command.as_ref(), prompt, images) {
         (Some(ExecCommand::Review(review_cli)), _, _) => {
@@ -648,12 +661,91 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         }
     };
 
+    // When --yolo (dangerously_bypass_approvals_and_sandbox) is set, also skip the git repo check
+    // since the user is explicitly running in an externally sandboxed environment.
+    if !skip_git_repo_check
+        && !dangerously_bypass_approvals_and_sandbox
+        && get_git_repo_root(&default_cwd).is_none()
+    {
+        eprintln!("Not inside a trusted directory and --skip-git-repo-check was not specified.");
+        std::process::exit(1);
+    }
+
+    let mut request_ids = RequestIdSequencer::new();
+    let mut client = InProcessAppServerClient::start(in_process_start_args)
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!("failed to initialize in-process app-server client: {err}")
+        })?;
+
+    // Handle resume subcommand through existing `thread/list` + `thread/resume`
+    // APIs so exec no longer reaches into rollout storage directly.
+    let (primary_thread_id, fallback_session_configured) = if let Some(ExecCommand::Resume(args)) =
+        command.as_ref()
+    {
+        if let Some(thread_id) =
+            resolve_resume_thread_id(&client, &config, state_db.as_ref(), args).await?
+        {
+            let response: ThreadResumeResponse = send_request_with_response(
+                &client,
+                ClientRequest::ThreadResume {
+                    request_id: request_ids.next(),
+                    params: thread_resume_params_from_config(&config, thread_id),
+                },
+                "thread/resume",
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+            let session_configured =
+                session_configured_from_thread_resume_response(&response, &config)
+                    .map_err(anyhow::Error::msg)?;
+            (session_configured.thread_id, session_configured)
+        } else {
+            let response: ThreadStartResponse = send_request_with_response(
+                &client,
+                ClientRequest::ThreadStart {
+                    request_id: request_ids.next(),
+                    params: thread_start_params_from_config(&config),
+                },
+                "thread/start",
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+            let session_configured =
+                session_configured_from_thread_start_response(&response, &config)
+                    .map_err(anyhow::Error::msg)?;
+            (session_configured.thread_id, session_configured)
+        }
+    } else {
+        let response: ThreadStartResponse = send_request_with_response(
+            &client,
+            ClientRequest::ThreadStart {
+                request_id: request_ids.next(),
+                params: thread_start_params_from_config(&config),
+            },
+            "thread/start",
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        let session_configured = session_configured_from_thread_start_response(&response, &config)
+            .map_err(anyhow::Error::msg)?;
+        (session_configured.thread_id, session_configured)
+    };
+
+    let primary_thread_id_for_span = primary_thread_id.to_string();
+    // Use the start/resume response as the authoritative bootstrap payload.
+    // Waiting for a later streamed `SessionConfigured` event adds up to 10s of
+    // avoidable startup latency on the in-process path.
+    let session_configured = fallback_session_configured;
+
+    exec_span.record("thread.id", primary_thread_id_for_span.as_str());
+
     // Print the effective configuration and initial request so users can see what Codex
     // is using.
     event_processor.print_config_summary(&config, &prompt_summary, &session_configured);
     if !json_mode
         && let Some(message) =
-            codex_core::config::system_bwrap_warning(config.permissions.sandbox_policy.get())
+            codex_core::config::system_bwrap_warning(config.permissions.permission_profile.get())
     {
         event_processor.process_warning(message);
     }
@@ -680,10 +772,13 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     params: TurnStartParams {
                         thread_id: primary_thread_id_for_span.clone(),
                         input: items.into_iter().map(Into::into).collect(),
+                        responsesapi_client_metadata: None,
+                        environments: None,
                         cwd: Some(default_cwd),
                         approval_policy: Some(default_approval_policy.into()),
                         approvals_reviewer: None,
-                        sandbox_policy: Some(default_sandbox_policy.clone().into()),
+                        sandbox_policy: None,
+                        permissions: None,
                         model: None,
                         service_tier: None,
                         effort: default_effort,
@@ -790,8 +885,13 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     error_seen = true;
                 }
 
-                maybe_backfill_turn_completed_items(&client, &mut request_ids, &mut notification)
-                    .await;
+                maybe_backfill_turn_completed_items(
+                    config.ephemeral,
+                    &client,
+                    &mut request_ids,
+                    &mut notification,
+                )
+                .await;
 
                 if should_process_notification(
                     &notification,
@@ -834,31 +934,22 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn sandbox_mode_from_policy(
-    sandbox_policy: &codex_protocol::protocol::SandboxPolicy,
-) -> Option<codex_app_server_protocol::SandboxMode> {
-    match sandbox_policy {
-        codex_protocol::protocol::SandboxPolicy::DangerFullAccess => {
-            Some(codex_app_server_protocol::SandboxMode::DangerFullAccess)
-        }
-        codex_protocol::protocol::SandboxPolicy::ReadOnly { .. } => {
-            Some(codex_app_server_protocol::SandboxMode::ReadOnly)
-        }
-        codex_protocol::protocol::SandboxPolicy::WorkspaceWrite { .. } => {
-            Some(codex_app_server_protocol::SandboxMode::WorkspaceWrite)
-        }
-        codex_protocol::protocol::SandboxPolicy::ExternalSandbox { .. } => None,
-    }
-}
-
 fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
+    let permissions = permissions_selection_from_config(config);
+    let sandbox = permissions.is_none().then(|| {
+        sandbox_mode_from_permission_profile(
+            &config.permissions.permission_profile(),
+            config.cwd.as_path(),
+        )
+    });
     ThreadStartParams {
         model: config.model.clone(),
         model_provider: Some(config.model_provider_id.clone()),
         cwd: Some(config.cwd.to_string_lossy().to_string()),
         approval_policy: Some(config.permissions.approval_policy.value().into()),
         approvals_reviewer: approvals_reviewer_override_from_config(config),
-        sandbox: sandbox_mode_from_policy(config.permissions.sandbox_policy.get()),
+        sandbox: sandbox.flatten(),
+        permissions,
         config: config_request_overrides_from_config(config),
         ephemeral: Some(config.ephemeral),
         ..ThreadStartParams::default()
@@ -866,6 +957,13 @@ fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
 }
 
 fn thread_resume_params_from_config(config: &Config, thread_id: String) -> ThreadResumeParams {
+    let permissions = permissions_selection_from_config(config);
+    let sandbox = permissions.is_none().then(|| {
+        sandbox_mode_from_permission_profile(
+            &config.permissions.permission_profile(),
+            config.cwd.as_path(),
+        )
+    });
     ThreadResumeParams {
         thread_id,
         model: config.model.clone(),
@@ -873,9 +971,60 @@ fn thread_resume_params_from_config(config: &Config, thread_id: String) -> Threa
         cwd: Some(config.cwd.to_string_lossy().to_string()),
         approval_policy: Some(config.permissions.approval_policy.value().into()),
         approvals_reviewer: approvals_reviewer_override_from_config(config),
-        sandbox: sandbox_mode_from_policy(config.permissions.sandbox_policy.get()),
+        sandbox: sandbox.flatten(),
+        permissions,
         config: config_request_overrides_from_config(config),
         ..ThreadResumeParams::default()
+    }
+}
+
+fn permissions_selection_from_config(config: &Config) -> Option<PermissionProfileSelectionParams> {
+    config
+        .permissions
+        .active_permission_profile()
+        .map(permissions_selection_from_active_profile)
+}
+
+fn permissions_selection_from_active_profile(
+    active: ActivePermissionProfile,
+) -> PermissionProfileSelectionParams {
+    let modifications = active
+        .modifications
+        .into_iter()
+        .map(|modification| match modification {
+            ActivePermissionProfileModification::AdditionalWritableRoot { path } => {
+                PermissionProfileModificationParams::AdditionalWritableRoot { path }
+            }
+        })
+        .collect::<Vec<_>>();
+    PermissionProfileSelectionParams::Profile {
+        id: active.id,
+        modifications: (!modifications.is_empty()).then_some(modifications),
+    }
+}
+
+fn sandbox_mode_from_permission_profile(
+    permission_profile: &PermissionProfile,
+    cwd: &Path,
+) -> Option<codex_app_server_protocol::SandboxMode> {
+    match permission_profile {
+        PermissionProfile::Disabled => {
+            Some(codex_app_server_protocol::SandboxMode::DangerFullAccess)
+        }
+        PermissionProfile::External { .. } => None,
+        PermissionProfile::Managed { .. } => {
+            let file_system_policy = permission_profile.file_system_sandbox_policy();
+            if file_system_policy.has_full_disk_write_access() {
+                permission_profile
+                    .network_sandbox_policy()
+                    .is_enabled()
+                    .then_some(codex_app_server_protocol::SandboxMode::DangerFullAccess)
+            } else if file_system_policy.can_write_path_with_cwd(cwd, cwd) {
+                Some(codex_app_server_protocol::SandboxMode::WorkspaceWrite)
+            } else {
+                Some(codex_app_server_protocol::SandboxMode::ReadOnly)
+            }
+        }
     }
 }
 
@@ -911,17 +1060,24 @@ where
 
 fn session_configured_from_thread_start_response(
     response: &ThreadStartResponse,
+    config: &Config,
 ) -> Result<SessionConfiguredEvent, String> {
     session_configured_from_thread_response(
+        &response.thread.session_id,
         &response.thread.id,
         response.thread.name.clone(),
         response.thread.path.clone(),
         response.model.clone(),
         response.model_provider.clone(),
-        response.service_tier,
+        response.service_tier.clone(),
         response.approval_policy.to_core(),
         response.approvals_reviewer.to_core(),
-        response.sandbox.to_core(),
+        response
+            .permission_profile
+            .clone()
+            .map(Into::into)
+            .unwrap_or_else(|| config.permissions.permission_profile()),
+        response.active_permission_profile.clone().map(Into::into),
         response.cwd.clone(),
         response.reasoning_effort,
     )
@@ -929,17 +1085,24 @@ fn session_configured_from_thread_start_response(
 
 fn session_configured_from_thread_resume_response(
     response: &ThreadResumeResponse,
+    config: &Config,
 ) -> Result<SessionConfiguredEvent, String> {
     session_configured_from_thread_response(
+        &response.thread.session_id,
         &response.thread.id,
         response.thread.name.clone(),
         response.thread.path.clone(),
         response.model.clone(),
         response.model_provider.clone(),
-        response.service_tier,
+        response.service_tier.clone(),
         response.approval_policy.to_core(),
         response.approvals_reviewer.to_core(),
-        response.sandbox.to_core(),
+        response
+            .permission_profile
+            .clone()
+            .map(Into::into)
+            .unwrap_or_else(|| config.permissions.permission_profile()),
+        response.active_permission_profile.clone().map(Into::into),
         response.cwd.clone(),
         response.reasoning_effort,
     )
@@ -959,35 +1122,40 @@ fn review_target_to_api(target: ReviewTarget) -> ApiReviewTarget {
     reason = "session mapping keeps explicit fields"
 )]
 fn session_configured_from_thread_response(
+    session_id: &str,
     thread_id: &str,
     thread_name: Option<String>,
     rollout_path: Option<PathBuf>,
     model: String,
     model_provider_id: String,
-    service_tier: Option<codex_protocol::config_types::ServiceTier>,
+    service_tier: Option<String>,
     approval_policy: AskForApproval,
     approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer,
-    sandbox_policy: SandboxPolicy,
-    cwd: PathBuf,
+    permission_profile: PermissionProfile,
+    active_permission_profile: Option<codex_protocol::models::ActivePermissionProfile>,
+    cwd: AbsolutePathBuf,
     reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
 ) -> Result<SessionConfiguredEvent, String> {
-    let session_id = codex_protocol::ThreadId::from_string(thread_id)
+    let session_id = SessionId::from_string(session_id)
+        .map_err(|err| format!("session id `{session_id}` is invalid: {err}"))?;
+    let thread_id = ThreadId::from_string(thread_id)
         .map_err(|err| format!("thread id `{thread_id}` is invalid: {err}"))?;
 
     Ok(SessionConfiguredEvent {
         session_id,
+        thread_id,
         forked_from_id: None,
+        thread_source: None,
         thread_name,
         model,
         model_provider_id,
         service_tier,
         approval_policy,
         approvals_reviewer,
-        sandbox_policy,
+        permission_profile,
+        active_permission_profile,
         cwd,
         reasoning_effort,
-        history_log_id: 0,
-        history_entry_count: 0,
         initial_messages: None,
         network_proxy: None,
         rollout_path,
@@ -1031,6 +1199,9 @@ fn should_process_notification(
         ServerNotification::ModelRerouted(notification) => {
             notification.thread_id == thread_id && notification.turn_id == turn_id
         }
+        ServerNotification::ModelVerification(notification) => {
+            notification.thread_id == thread_id && notification.turn_id == turn_id
+        }
         ServerNotification::ThreadTokenUsageUpdated(notification) => {
             notification.thread_id == thread_id && notification.turn_id == turn_id
         }
@@ -1051,6 +1222,7 @@ fn should_process_notification(
 }
 
 async fn maybe_backfill_turn_completed_items(
+    thread_ephemeral: bool,
     client: &InProcessAppServerClient,
     request_ids: &mut RequestIdSequencer,
     notification: &mut ServerNotification,
@@ -1059,12 +1231,13 @@ async fn maybe_backfill_turn_completed_items(
     // guaranteeing `turn/completed`. Because app-server currently emits that completion with an
     // empty `turn.items`, exec does one last `thread/read` here so human/json output can recover
     // the final message and reconcile any still-running items before shutdown.
+    if !should_backfill_turn_completed_items(thread_ephemeral, notification) {
+        return;
+    }
+
     let ServerNotification::TurnCompleted(payload) = notification else {
         return;
     };
-    if !payload.turn.items.is_empty() {
-        return;
-    }
 
     let response = send_request_with_response::<ThreadReadResponse>(
         client,
@@ -1089,6 +1262,19 @@ async fn maybe_backfill_turn_completed_items(
             warn!("thread/read failed while backfilling turn items for turn completion: {err}");
         }
     }
+}
+
+/// Returns true only when `exec` can safely recover missing turn items from
+/// rollout-backed thread history.
+fn should_backfill_turn_completed_items(
+    thread_ephemeral: bool,
+    notification: &ServerNotification,
+) -> bool {
+    let ServerNotification::TurnCompleted(payload) = notification else {
+        return false;
+    };
+
+    !thread_ephemeral && payload.turn.items.is_empty()
 }
 
 fn turn_items_for_thread(
@@ -1123,7 +1309,7 @@ async fn latest_thread_cwd(thread: &AppServerThread) -> PathBuf {
     {
         return cwd;
     }
-    thread.cwd.clone()
+    thread.cwd.to_path_buf()
 }
 
 async fn parse_latest_turn_context_cwd(path: &Path) -> Option<PathBuf> {
@@ -1144,18 +1330,13 @@ async fn parse_latest_turn_context_cwd(path: &Path) -> Option<PathBuf> {
 }
 
 fn cwds_match(current_cwd: &Path, session_cwd: &Path) -> bool {
-    match (
-        path_utils::normalize_for_path_comparison(current_cwd),
-        path_utils::normalize_for_path_comparison(session_cwd),
-    ) {
-        (Ok(current), Ok(session)) => current == session,
-        _ => current_cwd == session_cwd,
-    }
+    path_utils::paths_match_after_normalization(current_cwd, session_cwd)
 }
 
 async fn resolve_resume_thread_id(
     client: &InProcessAppServerClient,
     config: &Config,
+    state_db: Option<&StateDbHandle>,
     args: &crate::cli::ResumeArgs,
 ) -> anyhow::Result<Option<String>> {
     let model_providers = resume_lookup_model_providers(config, args);
@@ -1171,10 +1352,12 @@ async fn resolve_resume_thread_id(
                         cursor,
                         limit: Some(100),
                         sort_key: Some(ThreadSortKey::UpdatedAt),
+                        sort_direction: None,
                         model_providers: model_providers.clone(),
                         source_kinds: Some(all_thread_source_kinds()),
                         archived: Some(false),
                         cwd: None,
+                        use_state_db_only: false,
                         search_term: None,
                     },
                 },
@@ -1183,7 +1366,8 @@ async fn resolve_resume_thread_id(
             .await
             .map_err(anyhow::Error::msg)?;
             for thread in response.data {
-                if args.all || cwds_match(config.cwd.as_path(), &latest_thread_cwd(&thread).await) {
+                let latest_cwd = latest_thread_cwd(&thread).await;
+                if args.all || cwds_match(config.cwd.as_path(), latest_cwd.as_path()) {
                     return Ok(Some(thread.id));
                 }
             }
@@ -1200,6 +1384,28 @@ async fn resolve_resume_thread_id(
     if Uuid::parse_str(session_id).is_ok() {
         return Ok(Some(session_id.to_string()));
     }
+    if let Some(state_db) = state_db {
+        let cwd = (!args.all).then_some(config.cwd.as_path());
+        let resolved = state_db
+            .find_thread_by_exact_title(
+                session_id,
+                &[],
+                /*model_providers*/ None,
+                /*archived_only*/ false,
+                cwd,
+            )
+            .await?;
+        if let Some(thread) = resolved {
+            return Ok(Some(thread.id.to_string()));
+        }
+        if let Some((_, session_meta)) =
+            find_thread_meta_by_name_str(&config.codex_home, session_id, Some(state_db.as_ref()))
+                .await?
+            && (args.all || cwds_match(config.cwd.as_path(), &session_meta.meta.cwd))
+        {
+            return Ok(Some(session_meta.meta.id.to_string()));
+        }
+    }
 
     let mut cursor = None;
     loop {
@@ -1211,14 +1417,13 @@ async fn resolve_resume_thread_id(
                     cursor,
                     limit: Some(100),
                     sort_key: Some(ThreadSortKey::UpdatedAt),
+                    sort_direction: None,
                     model_providers: model_providers.clone(),
                     source_kinds: Some(all_thread_source_kinds()),
                     archived: Some(false),
                     cwd: None,
-                    // Thread names are attached separately from rollout titles, so name
-                    // resolution must scan the filtered list client-side instead of relying
-                    // on the backend `search_term` filter.
-                    search_term: None,
+                    use_state_db_only: false,
+                    search_term: Some(session_id.to_string()),
                 },
             },
             "thread/list",
@@ -1229,7 +1434,8 @@ async fn resolve_resume_thread_id(
             if thread.name.as_deref() != Some(session_id) {
                 continue;
             }
-            if args.all || cwds_match(config.cwd.as_path(), &latest_thread_cwd(&thread).await) {
+            let latest_cwd = latest_thread_cwd(&thread).await;
+            if args.all || cwds_match(config.cwd.as_path(), latest_cwd.as_path()) {
                 return Ok(Some(thread.id));
             }
         }
@@ -1397,6 +1603,15 @@ async fn handle_server_request(
                 request_id,
                 &method,
                 "chatgpt auth token refresh is not supported in exec mode".to_string(),
+            )
+            .await
+        }
+        ServerRequest::AttestationGenerate { request_id, .. } => {
+            reject_server_request(
+                client,
+                request_id,
+                &method,
+                "attestation generation is not supported in exec mode".to_string(),
             )
             .await
         }

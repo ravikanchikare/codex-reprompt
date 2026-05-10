@@ -9,13 +9,13 @@ use tracing::info;
 use tracing::warn;
 
 use crate::client::ModelClientSession;
-use crate::codex::INITIAL_SUBMIT_ID;
-use crate::codex::Session;
-use crate::codex::build_prompt;
-use crate::codex::built_tools;
+use crate::session::INITIAL_SUBMIT_ID;
+use crate::session::session::Session;
+use crate::session::turn::build_prompt;
+use crate::session::turn::built_tools;
+use codex_otel::STARTUP_PREWARM_AGE_AT_FIRST_TURN_METRIC;
+use codex_otel::STARTUP_PREWARM_DURATION_METRIC;
 use codex_otel::SessionTelemetry;
-use codex_otel::metrics::names::STARTUP_PREWARM_AGE_AT_FIRST_TURN_METRIC;
-use codex_otel::metrics::names::STARTUP_PREWARM_DURATION_METRIC;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::BaseInstructions;
 
@@ -232,7 +232,7 @@ async fn schedule_startup_prewarm_inner(
             &startup_turn_context.session_telemetry,
             startup_turn_context.reasoning_effort,
             startup_turn_context.reasoning_summary,
-            startup_turn_context.config.service_tier,
+            startup_turn_context.config.service_tier.clone(),
             startup_turn_metadata_header.as_deref(),
         )
         .await?;

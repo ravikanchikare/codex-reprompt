@@ -12,7 +12,7 @@ use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::RequestId;
-use codex_login::AuthCredentialsStoreMode;
+use codex_config::types::AuthCredentialsStoreMode;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use pretty_assertions::assert_eq;
 use std::path::Path;
@@ -24,7 +24,9 @@ use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
-const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+// Bazel CI can spend tens of seconds starting app-server subprocesses or
+// processing auth RPCs under load.
+const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn create_config_toml_custom_provider(
     codex_home: &Path,
