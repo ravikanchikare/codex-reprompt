@@ -295,6 +295,7 @@ pub(crate) fn find_app_mentions(
     mentions: &ToolMentions,
     apps: &[AppInfo],
     skill_names_lower: &HashSet<String>,
+    resolved_tool_tokens_lower: &HashSet<String>,
 ) -> Vec<AppInfo> {
     let mut explicit_names = HashSet::new();
     let mut selected_ids = HashSet::new();
@@ -318,6 +319,7 @@ pub(crate) fn find_app_mentions(
             && !explicit_names.contains(&slug)
             && slug_count == 1
             && !skill_names_lower.contains(&slug)
+            && !resolved_tool_tokens_lower.contains(&slug)
         {
             selected_ids.insert(app.id.clone());
         }

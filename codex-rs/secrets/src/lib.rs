@@ -17,7 +17,13 @@ mod local;
 mod sanitizer;
 
 pub use local::LocalSecretsBackend;
+pub use sanitizer::RedactionMapping;
+pub use sanitizer::RedactionResult;
+pub use sanitizer::SecretKind;
+pub use sanitizer::SecretRedactionOptions;
 pub use sanitizer::redact_secrets;
+pub use sanitizer::redact_secrets_structured;
+pub use sanitizer::rehydrate_redacted_text;
 
 const KEYRING_SERVICE: &str = "codex";
 
